@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="112" fill="#EDF0F4"/>
+  <circle cx="256" cy="256" r="168" fill="none" stroke="#2A4DAE" stroke-width="22"/>
+  <circle cx="256" cy="256" r="136" fill="none" stroke="#2A4DAE" stroke-width="6" stroke-dasharray="14 12"/>
+  <text x="256" y="300" text-anchor="middle" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, sans-serif" font-size="150" font-weight="700" fill="#A3305A" transform="rotate(-8 256 256)">语境</text>
+</svg>
