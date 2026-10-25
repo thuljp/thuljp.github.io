@@ -1,0 +1,2216 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="robots" content="noindex,nofollow">
+<title>Job Market Desk</title>
+<style>:root{color-scheme:light;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}body{margin:0;font:14px/1.5 system-ui,sans-serif}img{max-width:100%}[hidden]{display:none!important}</style>
+<script>
+/* Job Market Desk: GitHub Pages adapter.
+   Gives the app the same small interface it uses on claude.ai (window.claude.use("db" | "sample" | "downloads")),
+   backed by a JSON file in a private GitHub repo and by the DeepSeek API.
+   Secrets (GitHub token, DeepSeek key) live only in this browser's localStorage. */
+(() => {
+"use strict";
+const CFG_KEY = "jd-gh-config";
+const DEFAULTS = { owner:"thuljp", repo:"jobdesk-data", branch:"main", path:"desk.json", token:"", dsKey:"", dsBase:"https://api.deepseek.com", dsModel:"deepseek-flash" };
+function loadCfg(){ try { return {...DEFAULTS, ...JSON.parse(localStorage.getItem(CFG_KEY) || "{}")}; } catch { return {...DEFAULTS}; } }
+function saveCfg(c){ try { localStorage.setItem(CFG_KEY, JSON.stringify(c)); } catch {} }
+const cfg = loadCfg();
+const esc = v => String(v ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+/* ---------- UTF-8 base64 ---------- */
+function b64enc(str){ const bytes = new TextEncoder().encode(str); let bin = ""; for(let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000)); return btoa(bin); }
+function b64dec(b64){ const bin = atob(b64.replace(/\s/g, "")); const bytes = new Uint8Array(bin.length); for(let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i); return new TextDecoder().decode(bytes); }
+
+/* ---------- Sync status in the top bar ---------- */
+let statusText = "", statusKind = "";
+function setStatus(text, kind){ statusText = text; statusKind = kind || ""; const el = document.getElementById("sync-state"); if(el){ el.textContent = text; el.dataset.kind = statusKind; } }
+const hhmm = () => new Date().toLocaleTimeString("zh-CN", {hour:"2-digit", minute:"2-digit"});
+
+/* ---------- GitHub-backed document store ---------- */
+const COLLS = ["jobs","events","materials","qa","meta"];
+function makeStore(c){
+  const api = `https://api.github.com/repos/${encodeURIComponent(c.owner)}/${encodeURIComponent(c.repo)}/contents/${c.path.split("/").map(encodeURIComponent).join("/")}`;
+  const H = {Authorization:"Bearer " + c.token, Accept:"application/vnd.github+json", "X-GitHub-Api-Version":"2022-11-28"};
+  let data = empty(), sha = null, etag = null;
+  const pending = new Set(); const subs = {}; let timer = null, flushing = null, retryTimer = null;
+  function empty(){ const d = {version:1}; COLLS.forEach(k => d[k] = {}); return d; }
+  function norm(d){ const o = d && typeof d === "object" ? d : {}; COLLS.forEach(k => { if(!o[k] || typeof o[k] !== "object") o[k] = {}; }); return o; }
+  async function getRemote(conditional){
+    const h = {...H}; if(conditional && etag) h["If-None-Match"] = etag;
+    const r = await fetch(`${api}?ref=${encodeURIComponent(c.branch)}`, {headers:h, cache:"no-store"});
+    if(r.status === 304) return {status:304};
+    if(r.status === 404) return {status:404};
+    if(r.status === 401 || r.status === 403) throw {code:"auth", status:r.status, message:await r.text().catch(() => "")};
+    if(!r.ok) throw {code:"http", status:r.status, message:await r.text().catch(() => "")};
+    const j = await r.json(); const tag = r.headers.get("ETag");
+    let text;
+    if(j.content && j.encoding === "base64") text = b64dec(j.content);
+    else { const raw = await fetch(`${api}?ref=${encodeURIComponent(c.branch)}`, {headers:{...H, Accept:"application/vnd.github.raw"}, cache:"no-store"}); if(!raw.ok) throw {code:"http", status:raw.status}; text = await raw.text(); }
+    let parsed; try { parsed = JSON.parse(text || "{}"); } catch { throw {code:"corrupt", message:"desk.json 不是有效的 JSON"}; }
+    return {status:200, sha:j.sha, etag:tag, data:norm(parsed)};
+  }
+  function live(coll){ return Object.entries(data[coll] || {}).filter(([, v]) => v && !v._deleted); }
+  function emit(coll, changes, force){ if((changes.length || force) && subs[coll]) subs[coll]({docChanges:() => changes.map(([type, id, d]) => ({type, doc:{id, exists:true, data:() => d}})), metadata:{fromCache:false, hasPendingWrites:false}}); }
+  function diffInto(next, skip){
+    for(const coll of COLLS){
+      const a = data[coll] || {}, b = next[coll] || {}, ch = [];
+      for(const id of new Set([...Object.keys(a), ...Object.keys(b)])){
+        if(skip && skip.has(coll + "/" + id)) continue;
+        const x = a[id], y = b[id]; const xl = x && !x._deleted, yl = y && !y._deleted;
+        if(yl && !xl) ch.push(["added", id, y]); else if(!yl && xl) ch.push(["removed", id, x]); else if(yl && xl && JSON.stringify(x) !== JSON.stringify(y)) ch.push(["modified", id, y]);
+      }
+      emit(coll, ch);
+    }
+  }
+  function prune(d){ const cutoff = Date.now() - 30 * 864e5; const o = {...d}; for(const coll of COLLS){ o[coll] = {}; for(const [id, v] of Object.entries(d[coll] || {})) if(!(v && v._deleted && (v._u || 0) < cutoff)) o[coll][id] = v; } o.updatedAt = new Date().toISOString(); return o; }
+  async function put(body, message){
+    const r = await fetch(api, {method:"PUT", headers:{...H, "Content-Type":"application/json"}, body:JSON.stringify({message, content:b64enc(body), branch:c.branch, ...(sha ? {sha} : {})})});
+    if(r.status === 409 || r.status === 422) return {conflict:true};
+    if(r.status === 401 || r.status === 403) throw {code:"auth", status:r.status};
+    if(!r.ok) throw {code:"http", status:r.status, message:await r.text().catch(() => "")};
+    const j = await r.json(); return {sha:j.content && j.content.sha};
+  }
+  async function flush(){
+    if(flushing) return flushing;
+    flushing = (async () => {
+      for(let attempt = 0; attempt < 4 && pending.size; attempt++){
+        const mine = new Set(pending); pending.clear();
+        setStatus("保存中…", "busy");
+        try {
+          const body = JSON.stringify(prune(data));
+          if(body.length > 950000) setStatus("数据接近 1MB 上限，建议清理旧职位", "warn");
+          const res = await put(body, `desk: 更新 ${mine.size} 项`);
+          if(res.conflict){
+            const remote = await getRemote(false);
+            const merged = remote.status === 200 ? remote.data : empty();
+            for(const key of mine){ const [coll, id] = key.split("/"); merged[coll][id] = data[coll][id]; }
+            diffInto(merged, mine); data = merged; sha = remote.sha || null; etag = null;
+            mine.forEach(k => pending.add(k)); continue;
+          }
+          sha = res.sha || sha; etag = null; setStatus(`已同步 ${hhmm()}`, "ok");
+        } catch(e){
+          mine.forEach(k => pending.add(k));
+          setStatus(e && e.code === "auth" ? "GitHub 拒绝写入：检查令牌权限" : "保存失败，稍后自动重试", "err");
+          clearTimeout(retryTimer); retryTimer = setTimeout(() => flush(), 30000);
+          break;
+        }
+      }
+    })();
+    try { await flushing; } finally { flushing = null; }
+  }
+  function schedule(){ clearTimeout(timer); timer = setTimeout(flush, 1500); setStatus("有未保存的修改", "busy"); }
+  async function poll(){
+    if(document.hidden || flushing || pending.size) return;
+    try {
+      const r = await getRemote(true);
+      if(r.status === 200 && r.sha !== sha){ diffInto(r.data); data = r.data; sha = r.sha; }
+      if(r.etag) etag = r.etag;
+      if(r.status !== 304 || !statusText.startsWith("已同步")) setStatus(`已同步 ${hhmm()}`, "ok");
+    } catch(e){ setStatus(e && e.code === "auth" ? "GitHub 令牌无效或已过期" : "暂时连不上 GitHub", "err"); }
+  }
+  const store = {
+    async load(){
+      const r = await getRemote(false);
+      if(r.status === 404){ data = empty(); sha = null; }
+      else { data = r.data; sha = r.sha; etag = r.etag; }
+      setStatus(`已同步 ${hhmm()}`, "ok");
+      setInterval(poll, 45000);
+      document.addEventListener("visibilitychange", () => { if(!document.hidden) poll(); else if(pending.size) flush(); });
+      window.addEventListener("pagehide", () => { if(pending.size) flush(); });
+    },
+    collection(coll){ return { onSnapshot(cb){ subs[coll] = cb; setTimeout(() => emit(coll, live(coll).map(([id, v]) => ["added", id, v]), true), 0); return () => { delete subs[coll]; }; } }; },
+    doc(path){
+      const [coll, id] = path.split("/");
+      return {
+        async set(v){ const d = JSON.parse(JSON.stringify(v)); if(coll === "jobs" && typeof d.full === "string" && d.full.length > 6000) d.full = d.full.slice(0, 6000);
+          d._u = Date.now(); data[coll][id] = d; pending.add(coll + "/" + id); schedule(); },
+        async delete(){ data[coll][id] = {_deleted:true, _u:Date.now()}; pending.add(coll + "/" + id); schedule(); },
+      };
+    },
+    flushNow: flush, snapshot: () => JSON.parse(JSON.stringify(data)),
+  };
+  return store;
+}
+
+/* ---------- DeepSeek in place of Claude ---------- */
+function blobToDataUrl(b){ return new Promise((res, rej) => { const fr = new FileReader(); fr.onload = () => res(fr.result); fr.onerror = rej; fr.readAsDataURL(b); }); }
+function parseLoose(t){
+  const s = String(t || "").trim();
+  try { return JSON.parse(s); } catch {}
+  const f = /```(?:json)?\s*([\s\S]*?)```/.exec(s); if(f){ try { return JSON.parse(f[1]); } catch {} }
+  const i = Math.min(...["[","{"].map(ch => { const k = s.indexOf(ch); return k < 0 ? Infinity : k; })), j = Math.max(s.lastIndexOf("]"), s.lastIndexOf("}"));
+  if(isFinite(i) && j > i){ try { return JSON.parse(s.slice(i, j + 1)); } catch {} }
+  throw {code:"invalid_json", text:s};
+}
+function makeDeepseek(c){
+  const base = (c.dsBase || DEFAULTS.dsBase).replace(/\/+$/, "");
+  async function call(messages, tools, signal, onDelta){
+    const body = {model:c.dsModel || "deepseek-flash", messages, stream:true, thinking:{type:"disabled"}, max_tokens:8000};
+    if(tools && tools.length) body.tools = tools.map(t => ({type:"function", function:{name:t.name, description:t.description, parameters:t.inputSchema || {type:"object", properties:{}}}}));
+    let res;
+    try { res = await fetch(base + "/chat/completions", {method:"POST", headers:{"Content-Type":"application/json", Authorization:"Bearer " + c.dsKey}, body:JSON.stringify(body), signal}); }
+    catch(e){ if(signal && signal.aborted) throw {code:"cancelled"}; throw {code:"network", message:String(e)}; }
+    if(!res.ok){ const t = await res.text().catch(() => ""); throw {code: res.status === 401 ? "bad_key" : res.status === 402 ? "no_balance" : res.status === 429 ? "rate_limited" : res.status === 400 ? "bad_request" : "upstream_error", message:t.slice(0, 300)}; }
+    const reader = res.body.getReader(); const dec = new TextDecoder(); let buf = "", content = "", finish = null; const calls = [];
+    try {
+      for(;;){
+        const {done, value} = await reader.read(); if(done) break;
+        buf += dec.decode(value, {stream:true}); let k;
+        while((k = buf.indexOf("\n")) >= 0){
+          const line = buf.slice(0, k).trim(); buf = buf.slice(k + 1);
+          if(!line.startsWith("data:")) continue; const payload = line.slice(5).trim(); if(payload === "[DONE]") continue;
+          let j; try { j = JSON.parse(payload); } catch { continue; }
+          const ch = j.choices && j.choices[0]; if(!ch) continue; const d = ch.delta || {};
+          if(d.content){ content += d.content; onDelta && onDelta(content); }
+          if(d.tool_calls) for(const tc of d.tool_calls){ const n = tc.index ?? 0; calls[n] ||= {id:"", name:"", args:""}; if(tc.id) calls[n].id = tc.id; if(tc.function && tc.function.name) calls[n].name += tc.function.name; if(tc.function && tc.function.arguments) calls[n].args += tc.function.arguments; }
+          if(ch.finish_reason) finish = ch.finish_reason;
+        }
+      }
+    } catch(e){ if(signal && signal.aborted) throw {code:"cancelled", text:content}; throw {code:"network", message:String(e), text:content}; }
+    return {content, calls:calls.filter(Boolean), finish};
+  }
+  async function run(input, opts = {}){
+    let turns = typeof input === "string" ? [{role:"user", content:input}] : input.map(t => ({role:t.role, content:t.content}));
+    const msgs = [];
+    // In a conversation the page puts its standing instructions in the first turn: send them as the system message.
+    if(turns.length > 1 && turns[0].role === "user"){ msgs.push({role:"system", content:turns[0].content}); turns = turns.slice(1); }
+    for(const t of turns){ const last = msgs[msgs.length - 1]; if(last && last.role === t.role && last.role !== "system") last.content += "\n\n" + t.content; else msgs.push({...t}); }
+    if(opts.images && opts.images.length){ const urls = await Promise.all([...opts.images].slice(0, 4).map(blobToDataUrl)); const last = msgs[msgs.length - 1]; last.content = [{type:"text", text:last.content}, ...urls.map(u => ({type:"image_url", image_url:{url:u}}))]; }
+    const tools = opts.tools || []; let prefix = "";
+    for(let round = 0; round < 6; round++){
+      const r = await call(msgs, round < 5 ? tools : [], opts.signal, t => opts.onText && opts.onText({text:prefix + t, delta:""}));
+      if(r.calls.length && tools.length){
+        msgs.push({role:"assistant", content:r.content || "", tool_calls:r.calls.map(x => ({id:x.id, type:"function", function:{name:x.name, arguments:x.args || "{}"}}))});
+        if(r.content) prefix += r.content + "\n\n";
+        for(const x of r.calls){
+          const t = tools.find(y => y.name === x.name); let out;
+          try { out = t ? await t.execute(x.args ? JSON.parse(x.args) : {}, {signal:opts.signal}) : "没有这个工具"; } catch(e){ out = "Error: " + (e && e.message || e); }
+          msgs.push({role:"tool", tool_call_id:x.id, content:(typeof out === "string" ? out : JSON.stringify(out)).slice(0, 32000)});
+        }
+        continue;
+      }
+      const text = prefix + (r.content || "");
+      if(!text.trim()) throw {code:"empty_completion"};
+      opts.onText && opts.onText({text, delta:""});
+      return {text, truncated:r.finish === "length", modelTierApplied:"default"};
+    }
+    throw {code:"upstream_error", message:"工具调用轮数过多"};
+  }
+  run.json = async (input, opts = {}) => { const r = await run(input, {...opts, tools:undefined}); return parseLoose(r.text); };
+  run.limits = async () => ({maxPromptBytes:262144, tools:{maxCount:20}, images:{maxCount:4, maxInputBytes:2e7, mediaTypes:["image/jpeg","image/png","image/webp","image/gif"]}});
+  return run;
+}
+
+/* ---------- File download (plain browser, not sandboxed) ---------- */
+const downloads = { async save({filename, data}){ const blob = data instanceof Blob ? data : new Blob([data], {type:"application/json"}); const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = filename; document.body.appendChild(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000); return {}; } };
+
+/* ---------- The window.claude shim the app talks to ---------- */
+let storePromise = null;
+function getStore(){
+  if(!cfg.token || !cfg.owner || !cfg.repo) return Promise.resolve(null);
+  return storePromise ||= (async () => { const s = makeStore(cfg); try { await s.load(); return s; } catch(e){ window.__loadError = e; setStatus(e && e.code === "auth" ? "GitHub 令牌无效" : "连不上 GitHub", "err"); return null; } })();
+}
+window.claude = { use: async name => {
+  if(name === "db") return getStore();
+  if(name === "sample") return cfg.dsKey ? makeDeepseek(cfg) : null;
+  if(name === "downloads") return downloads;
+  return null;
+} };
+
+/* ---------- Connection settings (first run and from the Settings tab) ---------- */
+async function testGitHub(c){
+  const r = await fetch(`https://api.github.com/repos/${encodeURIComponent(c.owner)}/${encodeURIComponent(c.repo)}`, {headers:{Authorization:"Bearer " + c.token, Accept:"application/vnd.github+json"}, cache:"no-store"});
+  if(r.status === 404) return "找不到这个仓库，或者令牌没有访问它的权限。";
+  if(r.status === 401) return "令牌无效或已过期。";
+  if(!r.ok) return `GitHub 返回 ${r.status}。`;
+  const j = await r.json();
+  if(!j.private) return "warn:这个仓库是公开的，数据会被任何人看到。建议改成私有仓库。";
+  if(j.permissions && j.permissions.push === false) return "令牌只有读取权限，需要 Contents 的读写权限。";
+  return "";
+}
+async function testDeepseek(c){
+  try { const r = await fetch((c.dsBase || DEFAULTS.dsBase).replace(/\/+$/, "") + "/chat/completions", {method:"POST", headers:{"Content-Type":"application/json", Authorization:"Bearer " + c.dsKey}, body:JSON.stringify({model:c.dsModel, messages:[{role:"user", content:"回复 OK"}], max_tokens:5, thinking:{type:"disabled"}})});
+    if(r.status === 401) return "DeepSeek 密钥无效。"; if(r.status === 402) return "DeepSeek 账户余额不足。"; if(!r.ok) return `DeepSeek 返回 ${r.status}。`; return ""; }
+  catch(e){ return "浏览器无法直接连接 DeepSeek（可能是跨域限制）。可以在“接口地址”填一个转发服务的地址，见仓库里的 proxy/README。"; }
+}
+window.__showSetup = function(fromPrefs){
+  const main = document.getElementById("main"); if(!main) return;
+  const err = window.__loadError;
+  main.innerHTML = `
+    <div class="view-head"><div><h1>${fromPrefs ? "连接设置" : "连接你的数据"}</h1><p>这些信息只保存在这台设备的浏览器里，不会上传到任何地方。每台设备设置一次。</p></div></div>
+    ${err && !fromPrefs ? `<div class="panel callout" style="border-left-color:var(--urgent)"><div><strong>上次连接失败</strong><span>${esc(err.code === "auth" ? "GitHub 令牌无效、过期，或没有这个仓库的权限。" : err.code === "corrupt" ? "数据文件损坏：" + (err.message || "") : "连不上 GitHub，检查网络后重试。")}</span></div></div>` : ""}
+    <form class="panel pad setup" id="gh-setup">
+      <h2 class="ph">GitHub 私有数据仓库</h2>
+      <div class="f2">
+        <label class="field"><span>GitHub 用户名</span><input type="text" name="owner" value="${esc(cfg.owner)}" required></label>
+        <label class="field"><span>私有仓库名</span><input type="text" name="repo" value="${esc(cfg.repo)}" required></label>
+        <label class="field"><span>分支</span><input type="text" name="branch" value="${esc(cfg.branch)}" required></label>
+        <label class="field"><span>数据文件</span><input type="text" name="path" value="${esc(cfg.path)}" required></label>
+      </div>
+      <label class="field"><span>GitHub 令牌（fine-grained token，只授权这个仓库的 Contents 读写）</span><input type="password" name="token" value="${esc(cfg.token)}" autocomplete="off" required placeholder="github_pat_…"></label>
+      <h2 class="ph" style="margin-top:14px">DeepSeek（可选：识别招聘信息和 AI 助手）</h2>
+      <label class="field"><span>DeepSeek API 密钥</span><input type="password" name="dsKey" value="${esc(cfg.dsKey)}" autocomplete="off" placeholder="sk-…"></label>
+      <div class="f2">
+        <label class="field"><span>接口地址</span><input type="url" name="dsBase" value="${esc(cfg.dsBase)}"></label>
+        <label class="field"><span>模型</span><select name="dsModel">${["deepseek-flash","deepseek-v4-pro"].map(m => `<option${cfg.dsModel === m ? " selected" : ""}>${m}</option>`).join("")}</select></label>
+      </div>
+      <p class="hint" id="gh-msg" style="margin:0"></p>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end">
+        ${fromPrefs ? `<button class="btn ghost danger" type="button" id="gh-forget">清除这台设备上保存的令牌和密钥</button><button class="btn" type="button" id="gh-cancel">返回</button>` : ""}
+        <button class="btn primary" type="submit" id="gh-save">测试并保存</button>
+      </div>
+    </form>`;
+  const form = document.getElementById("gh-setup"), msg = document.getElementById("gh-msg");
+  form.addEventListener("submit", async e => {
+    e.preventDefault(); const fd = Object.fromEntries(new FormData(form)); const next = {...cfg, ...Object.fromEntries(Object.entries(fd).map(([k, v]) => [k, String(v).trim()]))};
+    const btn = document.getElementById("gh-save"); btn.disabled = true; msg.textContent = "正在测试 GitHub…";
+    let w = ""; try { w = await testGitHub(next); } catch { w = "连不上 GitHub，检查网络后重试。"; }
+    if(w && !w.startsWith("warn:")){ msg.textContent = w; btn.disabled = false; return; }
+    let note = w ? w.slice(5) + " " : "";
+    if(next.dsKey){ msg.textContent = "正在测试 DeepSeek…"; const d = await testDeepseek(next); if(d) note += d + "（GitHub 已连接，DeepSeek 可以稍后再改。）"; }
+    saveCfg(next); msg.textContent = (note || "连接成功。") + "正在载入…"; setTimeout(() => location.reload(), note ? 2500 : 600);
+  });
+  const forget = document.getElementById("gh-forget"); if(forget) forget.addEventListener("click", () => { saveCfg({...cfg, token:"", dsKey:""}); location.reload(); });
+  const cancel = document.getElementById("gh-cancel"); if(cancel) cancel.addEventListener("click", () => { location.hash = "prefs"; location.reload(); });
+};
+window.__ghPanel = function(){
+  return `<section class="panel pad"><h2 class="ph">连接</h2>
+    <p class="hint" style="margin:0 0 10px">数据保存在 GitHub 私有仓库 <b>${esc(cfg.owner)}/${esc(cfg.repo)}</b> 的 ${esc(cfg.path)}；AI 功能使用 DeepSeek（${cfg.dsKey ? esc(cfg.dsModel) : "未设置密钥"}）。同步状态：${esc(statusText || "—")}</p>
+    <button class="btn" type="button" onclick="window.__showSetup(true)">修改连接设置</button></section>`;
+};
+document.addEventListener("DOMContentLoaded", () => setStatus(statusText, statusKind));
+})();
+
+</script>
+</head>
+<body>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Schibsted+Grotesk:wght@400;500;600;700&display=swap">
+<style>
+/* Layout: sticky top bar with view tabs; one working pane per view; a job opens in a right-hand drawer (a full-screen sheet on phones). */
+:root{
+  --bg:#F2F4F6; --surface:#FFFFFF; --raised:#F8F9FB; --ink:#15202B; --muted:#5A6676; --faint:#8A94A2; --line:#DCE1E7; --hover:#ECEFF3;
+  --accent:#0E6B63; --accent-ink:#FFFFFF; --accent-soft:#DFF0ED;
+  --urgent:#B5381A; --urgent-soft:#FBE7E1; --soon:#946008; --soon-soft:#FAEFD6; --ok:#1E7640; --ok-soft:#E1F2E6;
+  --s-inbox:#C2387A; --s-watch:#8A94A2; --s-prep:#C98A12; --s-sent:#3A6BD1; --s-interview:#0E8C80; --s-flyout:#7A4CC2; --s-offer:#1E7640; --s-rejected:#B9BFC8; --s-skip:#D3D7DD;
+  --shadow:0 12px 40px rgba(21,32,43,.16);
+  --font:"Schibsted Grotesk",system-ui,-apple-system,"PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans SC",sans-serif;
+  --r:6px;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#11161C; --surface:#182029; --raised:#1D2630; --ink:#E6EBF0; --muted:#A1ACB9; --faint:#76818F; --line:#2B3541; --hover:#222C37;
+    --accent:#5FC2B5; --accent-ink:#0B1A18; --accent-soft:#17312E;
+    --urgent:#F08A6C; --urgent-soft:#3A1F18; --soon:#E3B45A; --soon-soft:#332812; --ok:#6CCB8C; --ok-soft:#16301F;
+    --s-inbox:#E585B2; --s-watch:#76818F; --s-prep:#E3B45A; --s-sent:#7FA3F0; --s-interview:#5FC2B5; --s-flyout:#B395EA; --s-offer:#6CCB8C; --s-rejected:#4A5562; --s-skip:#3A444F;
+    --shadow:0 12px 40px rgba(0,0,0,.5);
+    color-scheme:dark;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#11161C; --surface:#182029; --raised:#1D2630; --ink:#E6EBF0; --muted:#A1ACB9; --faint:#76818F; --line:#2B3541; --hover:#222C37;
+  --accent:#5FC2B5; --accent-ink:#0B1A18; --accent-soft:#17312E;
+  --urgent:#F08A6C; --urgent-soft:#3A1F18; --soon:#E3B45A; --soon-soft:#332812; --ok:#6CCB8C; --ok-soft:#16301F;
+  --s-inbox:#E585B2; --s-watch:#76818F; --s-prep:#E3B45A; --s-sent:#7FA3F0; --s-interview:#5FC2B5; --s-flyout:#B395EA; --s-offer:#6CCB8C; --s-rejected:#4A5562; --s-skip:#3A444F;
+  --shadow:0 12px 40px rgba(0,0,0,.5);
+  color-scheme:dark;
+}
+
+*,*::before,*::after{box-sizing:border-box}
+[hidden]{display:none!important}
+body{background:var(--bg); color:var(--ink); font:400 14px/1.5 var(--font); font-variant-numeric:tabular-nums}
+button,input,select,textarea{font:inherit; color:inherit}
+a{color:var(--accent)}
+:focus-visible{outline:2px solid var(--accent); outline-offset:2px}
+h1,h2,h3{margin:0; text-wrap:balance}
+
+.gutter{padding-left:max(16px,env(safe-area-inset-left,0px)); padding-right:max(16px,env(safe-area-inset-right,0px))}
+.inner{max-width:1180px; margin:0 auto}
+
+/* Top bar */
+body::before{content:""; position:fixed; inset:0 0 auto; height:env(safe-area-inset-top,0px); z-index:10; background:var(--surface)}
+.top{position:sticky; top:env(safe-area-inset-top,0px); z-index:9; background:var(--surface); border-bottom:1px solid var(--line)}
+.top .inner{display:flex; align-items:center; gap:24px; min-height:56px; flex-wrap:wrap}
+.brand{font-weight:700; font-size:16px; letter-spacing:-.01em; white-space:nowrap}
+.brand small{font-weight:400; color:var(--muted); font-size:13px; margin-left:8px}
+.tabs{display:flex; gap:2px; overflow-x:auto; scrollbar-width:none; flex:1; min-width:0}
+.tabs a{padding:17px 12px 15px; color:var(--muted); text-decoration:none; font-weight:500; white-space:nowrap; border-bottom:2px solid transparent}
+.tabs a:hover{color:var(--ink)}
+.tabs a[aria-current="page"]{color:var(--ink); border-bottom-color:var(--accent)}
+.top-actions{display:flex; gap:8px}
+
+main.inner{padding-block:24px 112px}
+.view-head{display:flex; align-items:flex-end; justify-content:space-between; gap:16px; flex-wrap:wrap; margin-bottom:18px}
+.view-head h1{font-size:22px; font-weight:650; letter-spacing:-.015em}
+.view-head p{margin:4px 0 0; color:var(--muted)}
+
+/* Buttons & fields */
+.btn{display:inline-flex; align-items:center; gap:6px; border:1px solid var(--line); background:var(--surface); padding:7px 12px; border-radius:var(--r); cursor:pointer; font-weight:500; white-space:nowrap; text-decoration:none; color:var(--ink)}
+.btn:hover{background:var(--hover)}
+.btn.primary{background:var(--accent); border-color:var(--accent); color:var(--accent-ink)}
+.btn.primary:hover{filter:brightness(1.08)}
+.btn.ghost{border-color:transparent; background:transparent}
+.btn.danger{color:var(--urgent)}
+.btn.danger[data-armed]{background:var(--urgent); color:var(--surface); border-color:var(--urgent)}
+.btn:disabled{opacity:.5; cursor:default}
+.field{display:flex; flex-direction:column; gap:4px; min-width:0}
+.field > span{font-size:12px; color:var(--muted); font-weight:500}
+input[type=text],input[type=url],input[type=search],input[type=date],input[type=time],select,textarea{
+  width:100%; border:1px solid var(--line); background:var(--surface); border-radius:var(--r); padding:7px 9px; min-width:0}
+textarea{resize:vertical; line-height:1.55}
+input:focus,select:focus,textarea:focus{outline:2px solid var(--accent); outline-offset:-1px; border-color:transparent}
+
+/* Panels */
+.panel{background:var(--surface); border:1px solid var(--line); border-radius:8px}
+.panel-head{display:flex; justify-content:space-between; align-items:baseline; gap:12px; padding:14px 16px 10px}
+.panel-head h2{font-size:15px; font-weight:650}
+.panel-head .count{color:var(--muted); font-size:13px}
+.empty{padding:28px 16px; color:var(--muted); text-align:center}
+.empty strong{display:block; color:var(--ink); font-weight:600; margin-bottom:4px}
+.empty .btn{margin-top:12px}
+
+/* Pipeline */
+.pipeline{padding:18px 18px 16px; margin-bottom:16px}
+.pipe-top{display:flex; justify-content:space-between; align-items:baseline; gap:12px; flex-wrap:wrap; margin-bottom:12px}
+.pipe-top h2{font-size:15px; font-weight:650}
+.pipe-top span{color:var(--muted)}
+.pipe-bar{display:flex; height:12px; border-radius:6px; overflow:hidden; background:var(--hover); gap:2px}
+.pipe-bar i{display:block; height:100%}
+.pipe-legend{display:grid; grid-template-columns:repeat(auto-fit,minmax(110px,1fr)); gap:12px; margin-top:14px}
+.pipe-legend button{all:unset; cursor:pointer; display:flex; flex-direction:column; gap:2px; padding:6px 8px; border-radius:var(--r)}
+.pipe-legend button:hover{background:var(--hover)}
+.pipe-legend button:focus-visible{outline:2px solid var(--accent)}
+.pipe-legend b{font-size:22px; font-weight:650; letter-spacing:-.02em}
+.pipe-legend span{display:flex; align-items:center; gap:6px; color:var(--muted); font-size:13px}
+.dot{width:8px; height:8px; border-radius:50%; flex:none; display:inline-block}
+
+.grid2{display:grid; grid-template-columns:minmax(0,1.15fr) minmax(0,1fr); gap:16px}
+
+/* Rows */
+.rows{list-style:none; margin:0; padding:0 0 6px}
+.row{display:grid; grid-template-columns:76px minmax(0,1fr) auto; gap:12px; align-items:center; padding:9px 16px; border-top:1px solid var(--line); cursor:pointer}
+.row:hover{background:var(--hover)}
+.row .main{min-width:0}
+.row .t1{font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.row .t2{color:var(--muted); font-size:13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.row .side{display:flex; align-items:center; gap:8px; color:var(--muted); font-size:13px}
+
+/* Countdown: the signature element */
+.tminus{display:flex; flex-direction:column; align-items:center; justify-content:center; border-radius:var(--r); padding:4px 0; line-height:1.1; background:var(--hover); color:var(--muted); min-height:42px}
+.tminus b{font-size:18px; font-weight:700; letter-spacing:-.02em; color:var(--ink)}
+.tminus small{font-size:11px}
+.tminus.urgent{background:var(--urgent-soft); color:var(--urgent)} .tminus.urgent b{color:var(--urgent)}
+.tminus.soon{background:var(--soon-soft); color:var(--soon)} .tminus.soon b{color:var(--soon)}
+.tminus.past{background:transparent; color:var(--faint)} .tminus.past b{color:var(--faint); font-size:14px}
+.tminus.none b{font-size:14px; color:var(--faint)}
+
+.pill{display:inline-flex; align-items:center; gap:6px; padding:2px 9px 2px 7px; border-radius:999px; background:var(--hover); font-size:12.5px; font-weight:500; white-space:nowrap; color:var(--ink)}
+.meter{display:inline-flex; align-items:center; gap:6px; font-size:12.5px; color:var(--muted); white-space:nowrap}
+.meter i{display:block; width:42px; height:5px; border-radius:3px; background:var(--hover); position:relative; overflow:hidden}
+.meter i::after{content:""; position:absolute; inset:0 auto 0 0; width:var(--p); background:var(--accent)}
+.meter.full{color:var(--ok)} .meter.full i::after{background:var(--ok)}
+.stars{color:var(--soon); letter-spacing:1px; font-size:12px}
+
+/* Jobs table */
+.toolbar{display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:12px}
+.toolbar input[type=search]{max-width:280px}
+.toolbar select{width:auto}
+.jobs-table{width:100%; border-collapse:collapse}
+.jobs-table th{text-align:left; font-size:12px; font-weight:500; color:var(--muted); padding:10px 12px; border-bottom:1px solid var(--line); white-space:nowrap}
+.jobs-table td{padding:9px 12px; border-bottom:1px solid var(--line); vertical-align:middle}
+.jobs-table tbody tr{cursor:pointer}
+.jobs-table tbody tr:hover{background:var(--hover)}
+.jobs-table tbody tr:last-child td{border-bottom:0}
+.jobs-table .inst{font-weight:600}
+.jobs-table .sub{color:var(--muted); font-size:13px}
+.jobs-table .tm{width:84px}
+.jobs-table .tminus{width:68px}
+.cell-clip{max-width:340px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+
+/* Agenda */
+.agenda-day{display:grid; grid-template-columns:120px minmax(0,1fr); gap:16px; padding:14px 16px; border-top:1px solid var(--line)}
+.agenda-day:first-child{border-top:0}
+.agenda-date b{display:block; font-size:15px; font-weight:650}
+.agenda-date span{color:var(--muted); font-size:13px}
+.agenda-date.today b{color:var(--accent)}
+.agenda-items{display:flex; flex-direction:column; gap:8px}
+.ev{display:grid; grid-template-columns:4px minmax(0,1fr) auto; gap:12px; align-items:start; padding:9px 12px 9px 0; border-radius:var(--r); background:var(--raised); cursor:pointer}
+.ev:hover{background:var(--hover)}
+.ev .bar{align-self:stretch; border-radius:0 3px 3px 0}
+.ev .t1{font-weight:600}
+.ev .t2{color:var(--muted); font-size:13px}
+.ev .when{text-align:right; font-size:13px; white-space:nowrap}
+.ev .when b{display:block; font-size:14px}
+.ev .when span{color:var(--muted)}
+
+/* Materials */
+.kind-group{padding:4px 0 8px}
+.kind-group + .kind-group{border-top:1px solid var(--line)}
+.kind-group h3{font-size:13px; font-weight:600; color:var(--muted); padding:12px 16px 4px}
+.mat{display:grid; grid-template-columns:minmax(0,1fr) auto; gap:12px; padding:9px 16px; cursor:pointer; align-items:center}
+.mat:hover{background:var(--hover)}
+.mat .t1{font-weight:600}
+.mat .t2{color:var(--muted); font-size:13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+
+/* Prep */
+.cats{display:flex; gap:6px; flex-wrap:wrap}
+.chip{border:1px solid var(--line); background:var(--surface); border-radius:999px; padding:4px 11px; cursor:pointer; font-size:13px; font-weight:500}
+.chip:hover{background:var(--hover)}
+.chip[aria-pressed="true"]{background:var(--ink); color:var(--surface); border-color:var(--ink)}
+.qa{border-top:1px solid var(--line)}
+.qa:first-child{border-top:0}
+.qa summary{list-style:none; display:grid; grid-template-columns:minmax(0,1fr) auto; gap:12px; padding:12px 16px; cursor:pointer; align-items:center}
+.qa summary::-webkit-details-marker{display:none}
+.qa summary:hover{background:var(--hover)}
+.qa .q{font-weight:600}
+.qa .q small{display:block; font-weight:400; color:var(--muted); font-size:12.5px; margin-top:2px}
+.qa .body{padding:0 16px 16px; display:flex; flex-direction:column; gap:10px}
+.lvl{display:inline-flex; border:1px solid var(--line); border-radius:var(--r); overflow:hidden}
+.lvl button{border:0; background:transparent; padding:4px 10px; cursor:pointer; font-size:12.5px; color:var(--muted)}
+.lvl button + button{border-left:1px solid var(--line)}
+.lvl button[aria-pressed="true"]{background:var(--accent-soft); color:var(--accent); font-weight:600}
+.lvl-tag{font-size:12px; padding:2px 8px; border-radius:999px; white-space:nowrap}
+.lvl-0{background:var(--hover); color:var(--muted)} .lvl-1{background:var(--soon-soft); color:var(--soon)} .lvl-2{background:var(--ok-soft); color:var(--ok)}
+
+/* Drawer */
+.scrim{position:fixed; inset:0; background:rgba(10,16,22,.38); z-index:20}
+.drawer{position:fixed; top:0; right:0; bottom:0; width:min(560px,100%); background:var(--surface); z-index:21; box-shadow:var(--shadow); display:flex; flex-direction:column;
+  padding-top:env(safe-area-inset-top,0px); padding-bottom:env(safe-area-inset-bottom,0px); padding-right:env(safe-area-inset-right,0px)}
+.drawer-head{display:flex; justify-content:space-between; align-items:center; gap:8px; padding:12px 16px; border-bottom:1px solid var(--line)}
+.drawer-head .crumb{color:var(--muted); font-size:13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.drawer-body{overflow-y:auto; padding:18px 20px 32px; display:flex; flex-direction:column; gap:20px}
+.big-input{font-size:20px !important; font-weight:650; letter-spacing:-.01em; border-color:transparent !important; padding:4px 6px !important; margin-left:-6px; width:calc(100% + 6px) !important}
+.big-input:hover{border-color:var(--line) !important}
+.sub-input{border-color:transparent !important; padding:3px 6px !important; margin-left:-6px; width:calc(100% + 6px) !important; color:var(--muted)}
+.sub-input:hover{border-color:var(--line) !important}
+.fgrid{display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px}
+.fgrid .wide{grid-column:span 2}
+.sec-title{font-size:13px; font-weight:600; color:var(--muted); margin-bottom:8px; display:flex; justify-content:space-between; align-items:center; gap:8px}
+.mchips{display:flex; flex-wrap:wrap; gap:6px}
+.mchip{border:1px dashed var(--line); background:transparent; color:var(--faint); padding:5px 10px; border-radius:var(--r); cursor:pointer; font-size:13px}
+.mchip[data-s="1"]{border-style:solid; border-color:var(--line); color:var(--ink); background:var(--surface)}
+.mchip[data-s="2"]{border-style:solid; border-color:var(--ok); background:var(--ok-soft); color:var(--ok); font-weight:600}
+.mchip[data-s="2"]::before{content:"✓ "}
+.hint{color:var(--faint); font-size:12.5px; margin:6px 0 0}
+.minilist{display:flex; flex-direction:column; gap:6px}
+.miniitem{display:flex; justify-content:space-between; gap:12px; padding:8px 10px; background:var(--raised); border-radius:var(--r); cursor:pointer}
+.miniitem:hover{background:var(--hover)}
+.miniitem span{color:var(--muted); font-size:13px; white-space:nowrap}
+.fulltext{white-space:pre-wrap; font-size:13px; color:var(--muted); max-height:340px; overflow:auto; background:var(--raised); padding:12px; border-radius:var(--r); margin-top:8px}
+.metaline{display:flex; flex-wrap:wrap; gap:6px 16px; color:var(--muted); font-size:12.5px}
+details > summary{cursor:pointer}
+
+/* Dialog */
+dialog{border:0; border-radius:10px; padding:0; width:min(640px,calc(100% - 24px)); max-height:calc(100% - 32px); background:var(--surface); color:var(--ink); box-shadow:var(--shadow)}
+dialog.wide{width:min(920px,calc(100% - 24px))}
+dialog::backdrop{background:rgba(10,16,22,.42)}
+.dlg{display:flex; flex-direction:column; max-height:calc(100vh - 32px)}
+.dlg-head{display:flex; justify-content:space-between; align-items:center; padding:14px 18px; border-bottom:1px solid var(--line)}
+.dlg-head h2{font-size:16px; font-weight:650}
+.dlg-body{padding:16px 18px; overflow-y:auto; display:flex; flex-direction:column; gap:14px}
+.dlg-foot{display:flex; justify-content:space-between; gap:8px; padding:12px 18px; border-top:1px solid var(--line); flex-wrap:wrap}
+.dlg-foot .r{display:flex; gap:8px; margin-left:auto}
+.f2{display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px}
+.f3{display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px}
+
+.drop{border:1.5px dashed var(--line); border-radius:8px; padding:26px 16px; text-align:center; color:var(--muted)}
+.drop.over{border-color:var(--accent); background:var(--accent-soft)}
+.drop label{color:var(--accent); font-weight:600; cursor:pointer; text-decoration:underline}
+.steps{margin:0; padding-left:20px; color:var(--muted)}
+.steps li{margin:2px 0}
+.imp-list{border:1px solid var(--line); border-radius:8px; max-height:46vh; overflow:auto}
+.imp-row{display:grid; grid-template-columns:22px minmax(0,1fr) 120px; gap:10px; align-items:start; padding:8px 12px; border-top:1px solid var(--line); cursor:pointer}
+.imp-row:first-child{border-top:0}
+.imp-row:hover{background:var(--hover)}
+.imp-row input{margin-top:3px}
+.imp-row .t1{font-weight:600}
+.imp-row .t2{font-size:12.5px; color:var(--muted)}
+.imp-row .d{font-size:13px; text-align:right; color:var(--muted)}
+.badge{font-size:11.5px; padding:1px 7px; border-radius:999px; background:var(--accent-soft); color:var(--accent); margin-left:6px; font-weight:500}
+.picklist{border:1px solid var(--line); border-radius:var(--r); max-height:180px; overflow:auto; padding:4px}
+.picklist label{display:flex; gap:8px; align-items:center; padding:4px 6px; border-radius:4px; cursor:pointer}
+.picklist label:hover{background:var(--hover)}
+.progress{height:6px; background:var(--hover); border-radius:3px; overflow:hidden}
+.progress i{display:block; height:100%; background:var(--accent); width:0}
+
+.callout{display:flex; justify-content:space-between; align-items:center; gap:12px; padding:14px 16px; margin-bottom:16px; border-left:4px solid var(--s-inbox); flex-wrap:wrap}
+.callout strong{display:block; font-weight:650}
+.callout span{color:var(--muted); font-size:13px}
+.btn.sm{padding:3px 9px; font-size:12.5px}
+.triage{display:inline-flex; gap:4px}
+.pcard{border:1px solid var(--line); border-radius:8px; padding:12px; display:flex; flex-direction:column; gap:10px}
+.pcard-head{display:flex; gap:10px; align-items:center}
+.pcard-head label{font-weight:600}
+.thumbs{display:flex; gap:8px; flex-wrap:wrap}
+.thumbs figure{margin:0; position:relative; width:84px; height:84px; border-radius:6px; overflow:hidden; border:1px solid var(--line)}
+.thumbs img{width:100%; height:100%; object-fit:cover}
+.thumbs button{position:absolute; top:2px; right:2px; border:0; border-radius:4px; background:var(--ink); color:var(--surface); font-size:11px; padding:1px 5px; cursor:pointer}
+.sheet-row{display:grid; grid-template-columns:22px minmax(0,1fr) 150px 240px; gap:10px; align-items:center; padding:9px 12px; border-top:1px solid var(--line)}
+.sheet-row:first-child{border-top:0}
+.sheet-row.check{box-shadow:inset 3px 0 0 var(--soon)}
+.sheet-row .t1{font-weight:600}
+.sheet-row .t2{font-size:12.5px; color:var(--muted)}
+@media (max-width:760px){ .sheet-row{grid-template-columns:22px minmax(0,1fr)} .sheet-row input[type=date], .sheet-row select{grid-column:2} }
+.prefs-grid{display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:16px; align-items:start}
+.panel.pad{padding:16px 18px}
+.ph{font-size:15px; font-weight:650; margin-bottom:6px}
+.ph3{font-size:13px; font-weight:600; color:var(--muted); margin:16px 0 8px}
+.pref-fields{display:flex; flex-direction:column; gap:10px}
+.runlog{background:var(--raised); border-radius:var(--r); padding:10px 12px; display:flex; flex-direction:column; gap:2px}
+.ed-list{display:flex; flex-direction:column; gap:6px}
+.ed-row{display:flex; gap:6px; align-items:center}
+.ed-row input[type=text]{flex:1}
+.ed-def{display:inline-flex; gap:4px; align-items:center; font-size:12.5px; color:var(--muted); white-space:nowrap}
+.ed-add{display:flex; gap:6px; margin-top:4px}
+.ed-add input{flex:1}
+.tagchip{border:1px solid var(--line); background:transparent; border-radius:999px; padding:4px 11px; cursor:pointer; font-size:13px; color:var(--muted)}
+.tagchip[aria-pressed="true"]{background:var(--accent-soft); color:var(--accent); border-color:var(--accent); font-weight:600}
+.tagmini{display:inline-block; font-size:11.5px; padding:0 7px; border-radius:999px; background:var(--accent-soft); color:var(--accent); margin-left:6px; font-weight:500; vertical-align:1px}
+.newmini{display:inline-block; font-size:11px; padding:0 6px; border-radius:999px; background:var(--s-inbox); color:var(--surface); margin-left:6px; font-weight:600; vertical-align:1px}
+@media (max-width:860px){ .prefs-grid{grid-template-columns:1fr} .ed-row{flex-wrap:wrap} }
+.seg{display:inline-flex; border:1px solid var(--line); border-radius:var(--r); overflow:hidden; background:var(--surface)}
+.seg button{border:0; background:transparent; padding:7px 12px; cursor:pointer; color:var(--muted); font-weight:500}
+.seg button + button{border-left:1px solid var(--line)}
+.seg button[aria-pressed="true"]{background:var(--ink); color:var(--surface)}
+.selcell{width:34px; padding-right:0 !important}
+.selcell input{width:16px; height:16px; cursor:pointer}
+.jobs-table tr.selected{background:var(--accent-soft)}
+.bulkbar{position:fixed; left:50%; transform:translateX(-50%); bottom:calc(16px + env(safe-area-inset-bottom,0px)); z-index:15; display:flex; gap:8px; align-items:center; flex-wrap:wrap;
+  background:var(--surface); border:1px solid var(--line); box-shadow:var(--shadow); border-radius:10px; padding:10px 14px; max-width:calc(100% - 32px)}
+.bulkbar select{width:auto}
+.kanban{display:flex; gap:12px; overflow-x:auto; padding-bottom:12px; align-items:flex-start}
+.kcol{flex:0 0 250px; background:var(--raised); border:1px solid var(--line); border-radius:10px; display:flex; flex-direction:column; max-height:calc(100vh - 230px)}
+.kcol.folded{flex-basis:150px}
+.kcol.over{border-color:var(--accent); box-shadow:inset 0 0 0 2px var(--accent)}
+.khead{display:flex; align-items:center; gap:6px; padding:10px 12px; border-bottom:1px solid var(--line)}
+.khead b{font-weight:600}
+.khead .btn{margin-left:auto}
+.kcount{color:var(--muted); font-size:12.5px}
+.kbody{padding:8px; display:flex; flex-direction:column; gap:8px; overflow-y:auto; min-height:60px}
+.kempty{color:var(--faint); font-size:12.5px; text-align:center; padding:14px 0; border:1px dashed var(--line); border-radius:var(--r)}
+.kcard{background:var(--surface); border:1px solid var(--line); border-radius:8px; padding:9px 10px; cursor:grab; display:flex; flex-direction:column; gap:4px}
+.kcard:hover{border-color:var(--faint)}
+.kcard.dragging{opacity:.45}
+.kc-top{display:flex; justify-content:space-between; gap:8px; align-items:baseline}
+.kc-inst{font-weight:600; line-height:1.35}
+.kc-sub{color:var(--muted); font-size:12.5px; line-height:1.35}
+.kc-foot{display:flex; align-items:center; gap:6px; flex-wrap:wrap}
+.kc-move{display:none; font-size:12.5px; padding:3px 6px}
+@media (pointer:coarse){ .kc-move{display:block} }
+.dlmini{font-size:11.5px; padding:1px 7px; border-radius:999px; background:var(--hover); color:var(--muted); white-space:nowrap; font-weight:500}
+.dlmini.urgent{background:var(--urgent-soft); color:var(--urgent)} .dlmini.soon{background:var(--soon-soft); color:var(--soon)} .dlmini.past{color:var(--faint); background:transparent}
+@media (max-width:860px){
+  .jobs-table tr{grid-template-columns:24px 76px minmax(0,1fr) !important}
+  .jobs-table td.selcell{grid-row:span 3; padding-top:12px !important}
+  .kcol{flex-basis:78vw} .kcol.folded{flex-basis:120px}
+}
+.month{padding:12px 12px 14px}
+.mhead{display:flex; align-items:center; gap:8px; padding:0 4px 10px}
+.mhead h2{font-size:16px; font-weight:650; min-width:110px; text-align:center}
+.mhead .btn.sm{margin-left:auto}
+.mgrid{display:grid; grid-template-columns:repeat(7,minmax(0,1fr)); gap:4px}
+.mw{font-size:12px; color:var(--muted); text-align:center; padding:2px 0 4px}
+.mday{all:unset; box-sizing:border-box; min-height:92px; border:1px solid var(--line); border-radius:6px; padding:4px 5px; display:flex; flex-direction:column; gap:3px; cursor:pointer; background:var(--surface); min-width:0}
+.mday:hover{border-color:var(--faint)}
+.mday:focus-visible{outline:2px solid var(--accent)}
+.mday.out{background:transparent; opacity:.55}
+.mday.today .mnum{background:var(--accent); color:var(--accent-ink); border-radius:999px; padding:0 6px}
+.mday.picked{border-color:var(--accent); box-shadow:inset 0 0 0 1px var(--accent)}
+.mnum{font-size:12.5px; font-weight:600; align-self:flex-start}
+.mchipz{display:flex; flex-direction:column; gap:2px; min-width:0}
+.mc{font-size:11px; line-height:1.35; padding:0 4px; border-radius:3px; border-left:3px solid var(--c); background:var(--raised); white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+.mmore{font-size:11px; color:var(--muted)}
+.mdots{display:none; gap:3px}
+.mdots i{width:6px; height:6px; border-radius:50%}
+@media (max-width:760px){ .mday{min-height:52px; align-items:center} .mchipz{display:none} .mdots{display:flex} .mnum{align-self:center} }
+.reminders{margin-bottom:16px}
+.rlist{list-style:none; margin:0; padding:0 0 6px}
+.rlist li{display:flex; justify-content:space-between; gap:10px; align-items:center; padding:8px 16px; border-top:1px solid var(--line); box-shadow:inset 3px 0 0 var(--faint)}
+.rlist li.r-urgent{box-shadow:inset 3px 0 0 var(--urgent)}
+.rlist li.r-soon{box-shadow:inset 3px 0 0 var(--soon)}
+.rlist li.r-info{box-shadow:inset 3px 0 0 var(--accent)}
+.rtext{min-width:0}
+.ract{display:flex; gap:4px; flex:none}
+.ai-fab{position:fixed; right:calc(16px + env(safe-area-inset-right,0px)); bottom:calc(16px + env(safe-area-inset-bottom,0px)); z-index:18; border:0; border-radius:999px; padding:11px 18px;
+  background:var(--ink); color:var(--surface); font-weight:600; cursor:pointer; box-shadow:var(--shadow)}
+.ai-fab:hover{filter:brightness(1.15)}
+.ai-panel{position:fixed; right:calc(16px + env(safe-area-inset-right,0px)); bottom:calc(16px + env(safe-area-inset-bottom,0px)); z-index:19; width:min(430px, calc(100% - 32px)); height:min(680px, calc(100% - 96px));
+  background:var(--surface); border:1px solid var(--line); border-radius:12px; box-shadow:var(--shadow); display:flex; flex-direction:column; overflow:hidden}
+.ai-head{display:flex; align-items:baseline; gap:8px; padding:12px 14px; border-bottom:1px solid var(--line); flex-wrap:wrap}
+.ai-log{flex:1; overflow-y:auto; padding:14px; display:flex; flex-direction:column; gap:10px}
+.ai-u{align-self:flex-end; max-width:85%; background:var(--accent); color:var(--accent-ink); padding:8px 12px; border-radius:12px 12px 2px 12px; white-space:pre-wrap}
+.ai-a{align-self:flex-start; max-width:95%; background:var(--raised); padding:8px 12px; border-radius:12px 12px 12px 2px; display:flex; flex-direction:column; gap:6px}
+.ai-a p{margin:0} .ai-a ul,.ai-a ol{margin:0; padding-left:20px} .ai-a li{margin:2px 0}
+.ai-a code{font-size:12.5px; background:var(--hover); padding:0 4px; border-radius:3px}
+.ai-note{font-size:12px; color:var(--muted)}
+.ai-note::before{content:"· "}
+.ai-err{color:var(--soon); font-size:13px}
+.ai-a .btn{align-self:flex-start}
+.ai-empty p{color:var(--muted); margin:0 0 10px}
+.ai-sugs{display:flex; flex-direction:column; gap:6px; align-items:flex-start}
+.ai-sugs .chip{text-align:left; border-radius:8px}
+.ai-form{display:flex; gap:8px; padding:10px; border-top:1px solid var(--line); align-items:flex-end}
+.ai-form textarea{flex:1; resize:none; max-height:140px}
+@media (max-width:600px){ .ai-panel{right:0; left:0; bottom:0; top:0; width:auto; height:auto; border-radius:0; padding-top:env(safe-area-inset-top,0px); padding-bottom:env(safe-area-inset-bottom,0px)} }
+.sync{font-size:12px; color:var(--muted); white-space:nowrap}
+.sync[data-kind="err"]{color:var(--urgent)} .sync[data-kind="warn"],.sync[data-kind="busy"]{color:var(--soon)}
+.setup{display:flex; flex-direction:column; gap:12px; max-width:720px}
+.setup input[type=password]{width:100%; border:1px solid var(--line); background:var(--surface); color:var(--ink); border-radius:var(--r); padding:7px 9px}
+.setup input[type=password]:focus{outline:2px solid var(--accent); outline-offset:-1px; border-color:transparent}
+.toast{position:fixed; left:max(16px,env(safe-area-inset-left,0px)); bottom:calc(16px + env(safe-area-inset-bottom,0px)); z-index:40; background:var(--ink); color:var(--surface); padding:10px 14px; border-radius:var(--r); box-shadow:var(--shadow); max-width:calc(100% - 32px)}
+.status-line{color:var(--muted); font-size:12.5px}
+
+@media (max-width:860px){
+  .grid2{grid-template-columns:1fr}
+  .jobs-table thead{display:none}
+  .jobs-table, .jobs-table tbody{display:block}
+  .jobs-table tr{display:grid; grid-template-columns:76px minmax(0,1fr); gap:4px 12px; padding:10px 12px; border-bottom:1px solid var(--line)}
+  .jobs-table td{display:block; padding:0; border:0}
+  .jobs-table td.tm{grid-row:span 3}
+  .jobs-table td.c-prio{display:none}
+  .jobs-table td.c-status,.jobs-table td.c-mat{display:inline-block}
+  .cell-clip{max-width:none; white-space:normal}
+  .agenda-day{grid-template-columns:1fr; gap:8px}
+  .fgrid{grid-template-columns:1fr 1fr}
+  .fgrid .wide{grid-column:1 / -1}
+  .f3{grid-template-columns:1fr 1fr}
+  .brand small{display:none}
+}
+@media (max-width:520px){
+  .top .inner{gap:4px 16px; padding-top:8px}
+  .tabs{order:3; flex-basis:100%}
+  .tabs a{padding:10px 10px 12px}
+  .f2,.f3{grid-template-columns:1fr}
+  .row{grid-template-columns:64px minmax(0,1fr)}
+  .row .side{grid-column:2}
+  .imp-row{grid-template-columns:22px minmax(0,1fr)}
+  .imp-row .d{grid-column:2; text-align:left}
+}
+@media (prefers-reduced-motion:reduce){*{transition:none!important; animation:none!important}}
+</style>
+
+<header class="top gutter">
+  <div class="inner">
+    <div class="brand">Job Market Desk<small>2026–27 国内教职</small></div><span id="sync-state" class="sync" aria-live="polite"></span>
+    <nav class="tabs" aria-label="视图">
+      <a href="#overview" data-view="overview">总览</a>
+      <a href="#jobs" data-view="jobs">职位</a>
+      <a href="#calendar" data-view="calendar">日程</a>
+      <a href="#materials" data-view="materials">材料</a>
+      <a href="#prep" data-view="prep">面试准备</a>
+      <a href="#prefs" data-view="prefs">设置</a>
+    </nav>
+    <div class="top-actions">
+      <button class="btn" id="btn-import" type="button">导入表格</button>
+      <button class="btn primary" type="button" data-parse hidden id="btn-parse">识别招聘信息</button>
+    </div>
+  </div>
+</header>
+
+<main class="inner gutter" id="main">
+  <div class="empty" id="boot"><strong>正在连接你的数据…</strong>首次打开时可能需要你允许这个页面保存数据。</div>
+</main>
+
+<div id="drawer-root"></div>
+<dialog id="dlg"></dialog>
+<div id="ai-root"></div>
+<button class="ai-fab" id="ai-fab" type="button" hidden>问 AI</button>
+<div class="toast" id="toast" hidden></div>
+
+<script>
+(() => {
+"use strict";
+
+/* ---------- Constants ---------- */
+const STATUSES = [
+  {k:"inbox",     l:"待筛选",    d:"检索或识别到的新职位，还没看过"},
+  {k:"watch",     l:"待定",      d:"感兴趣，还没决定是否申请"},
+  {k:"prep",      l:"准备中",    d:"决定申请，正在准备材料"},
+  {k:"sent",      l:"已提交",    d:"材料已提交，等待回复"},
+  {k:"interview", l:"初面",      d:"拿到初面（视频或年会）"},
+  {k:"flyout",    l:"校园面试",  d:"受邀到校：学术报告、试讲、面谈"},
+  {k:"offer",     l:"Offer",     d:"拿到 offer，谈条件或已签约"},
+  {k:"rejected",  l:"已拒",      d:"被拒或职位取消"},
+  {k:"skip",      l:"不申请",    d:"决定放弃"},
+];
+const ST = Object.fromEntries(STATUSES.map(s => [s.k, s]));
+const CLOSED = new Set(["rejected","skip"]);
+const EARLY = new Set(["inbox","watch","prep"]);
+/* Defaults; the user's own lists live in meta/settings and replace these at load */
+const DEFAULT_MATS = [
+  {k:"cv",l:"英文 CV",def:true},{k:"cvzh",l:"中文简历"},{k:"jmp",l:"JMP / 代表作",def:true},{k:"research",l:"研究计划",def:true},
+  {k:"teaching",l:"教学陈述"},{k:"letters",l:"推荐信",def:true},{k:"cover",l:"求职信"},{k:"degree",l:"学位证明 / 成绩单",def:true},
+  {k:"form",l:"学校申请表"},{k:"idcard",l:"身份证件"},{k:"awards",l:"获奖 / 项目证明"},
+];
+const DEFAULT_QA_CATS = ["学术报告","研究规划","教学与试讲","动机与匹配","考核与待遇","通用"];
+const DEFAULT_TAGS = ["重点","冲刺","稳妥","需先联系"];
+let MATS = DEFAULT_MATS, MAT_KEYS = [], DEFAULT_REQ = {}, QA_CATS = DEFAULT_QA_CATS, TAGS = DEFAULT_TAGS;
+function applySettings(){
+  const st = (S.meta && S.meta.get("settings")) || {};
+  MATS = Array.isArray(st.materials) && st.materials.length ? st.materials : DEFAULT_MATS;
+  MAT_KEYS = MATS.map(m => m.k);
+  DEFAULT_REQ = Object.fromEntries(MATS.filter(m => m.def).map(m => [m.k, 1]));
+  QA_CATS = Array.isArray(st.qaCats) && st.qaCats.length ? st.qaCats : DEFAULT_QA_CATS;
+  TAGS = Array.isArray(st.tags) ? st.tags : DEFAULT_TAGS;
+}
+const PORTALS = ["","邮件投递","学校招聘系统","学院官网报名","EconJobMarket","AEA JOE","Interfolio","AcademicJobsOnline","其他"];
+const JOB_TYPES = ["","助理教授（预聘/长聘轨）","讲师","副研究员/研究员","师资博士后","博士后","副教授及以上","多个职级","其他"];
+const SOURCES = ["","学校官网","微信公众号","人才网","EJM","JOE","他人推荐","其他"];
+const EV_TYPES = [
+  {k:"interview",l:"初面",c:"var(--s-interview)"},
+  {k:"flyout",l:"校园面试",c:"var(--s-flyout)"},
+  {k:"talk",l:"学术报告",c:"var(--s-sent)"},
+  {k:"demo",l:"试讲",c:"var(--s-prep)"},
+  {k:"deadline",l:"Offer 答复截止",c:"var(--urgent)"},
+  {k:"other",l:"其他",c:"var(--s-watch)"},
+];
+const EVT = Object.fromEntries(EV_TYPES.map(t => [t.k, t]));
+const FORMATS = ["","视频面试（腾讯会议 / Zoom）","年会现场","到校","电话","其他"];
+const TZS = [
+  ["Asia/Shanghai","北京"],["America/New_York","美东"],["America/Chicago","美中"],["America/Los_Angeles","美西"],
+  ["Europe/London","英国"],["Europe/Paris","欧洲中部"],["Asia/Singapore","新加坡"],["Australia/Sydney","悉尼"],
+];
+const TZL = Object.fromEntries(TZS);
+const MAT_KINDS = ["英文 CV","中文简历","JMP / 代表作","研究计划","教学陈述","求职信","其他"];
+/* Target region: mainland China plus Macao (Hong Kong, Taiwan and elsewhere are out) */
+const REGION_OUT = /hong\s*kong|taiwan|taipei|香港|台湾/i;
+function isMainland(x){ const loc = String(x.loc || ""); const t = [loc, x.inst].join(" ");
+  if(/maca[uo]|澳门/i.test(t)) return true;
+  if(loc && /shenzhen|guangzhou|zhuhai|深圳|广州|珠海/i.test(loc)) return true;
+  return /china|中国|p\.?\s?r\.?\s?c/i.test(t) && !REGION_OUT.test(t); }
+const LOCAL_TZ = (() => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone || "Asia/Shanghai"; } catch { return "Asia/Shanghai"; } })();
+
+/* ---------- State ---------- */
+const S = { db:null, jobs:new Map(), events:new Map(), mats:new Map(), qa:new Map(), meta:new Map(),
+  loaded:{jobs:false,events:false,mats:false,qa:false,meta:false}, view:"overview",
+  jobFilter:{q:"", status:"active", sort:"deadline", tag:"", onlyNew:false}, calPast:false, calDeadlines:true,
+  qaCat:"全部", drawerJob:null, downloads:null, denied:false, sel:new Set(),
+  jobView: lsGet("jd-jobview") || "list", calMode: lsGet("jd-calmode") || "month", calMonth:"", calDay:"" };
+function lsGet(k){ try { return localStorage.getItem(k); } catch { return null; } }
+function lsSet(k, v){ try { localStorage.setItem(k, v); } catch {} }
+applySettings();
+
+/* ---------- Utils ---------- */
+const $ = (s, el=document) => el.querySelector(s);
+const esc = v => String(v ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const pad = n => String(n).padStart(2,"0");
+const ymd = d => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
+const todayStr = () => ymd(new Date());
+const nowIso = () => new Date().toISOString();
+function parseYmd(s){ const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s||""); return m ? new Date(+m[1], +m[2]-1, +m[3]) : null; }
+function daysUntil(s){ const d = parseYmd(s); if(!d) return null; const t = parseYmd(todayStr()); return Math.round((d - t) / 864e5); }
+const WD = ["周日","周一","周二","周三","周四","周五","周六"];
+function fmtDate(s, withWd=true){ const d = parseYmd(s); if(!d) return ""; const thisYear = d.getFullYear() === new Date().getFullYear();
+  return `${thisYear ? "" : d.getFullYear()+"年"}${d.getMonth()+1}月${d.getDate()}日${withWd ? " "+WD[d.getDay()] : ""}`; }
+function uid(){ return Date.now().toString(36) + Math.random().toString(36).slice(2,8); }
+function toast(msg){ const t = $("#toast"); t.textContent = msg; t.hidden = false; clearTimeout(toast._t); toast._t = setTimeout(() => t.hidden = true, 3200); }
+function linkify(t){ return esc(t).replace(/https?:\/\/[^\s<，,；;）)]+/g, u => `<a href="${u}" target="_blank" rel="noopener">${u.length > 70 ? u.slice(0, 67) + "…" : u}</a>`); }
+function host(u){ try { return new URL(u).hostname.replace(/^www\./,""); } catch { return ""; } }
+
+/* Time zones */
+function tzOffset(tz, ms){
+  const p = Object.fromEntries(new Intl.DateTimeFormat("en-US",{timeZone:tz,hourCycle:"h23",year:"numeric",month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",second:"2-digit"})
+    .formatToParts(new Date(ms)).map(x => [x.type, x.value]));
+  return Date.UTC(+p.year, +p.month-1, +p.day, +p.hour % 24, +p.minute, +p.second) - ms;
+}
+function zonedToUtc(date, time, tz){
+  const [y,m,d] = date.split("-").map(Number); const [hh,mm] = (time||"00:00").split(":").map(Number);
+  const guess = Date.UTC(y, m-1, d, hh, mm);
+  try { const o1 = tzOffset(tz, guess); let t = guess - o1; const o2 = tzOffset(tz, t); if(o2 !== o1) t = guess - o2; return t; }
+  catch { return new Date(y, m-1, d, hh, mm).getTime(); }
+}
+function partsIn(ms, tz){
+  const f = new Intl.DateTimeFormat("en-CA",{timeZone:tz,year:"numeric",month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",hourCycle:"h23"});
+  const p = Object.fromEntries(f.formatToParts(new Date(ms)).map(x => [x.type, x.value]));
+  return {date:`${p.year}-${p.month}-${p.day}`, time:`${p.hour}:${p.minute}`};
+}
+/* An event's position in the viewer's own time zone */
+function evLocal(ev){
+  if(!ev.date) return {date:"", time:"", ms:Infinity};
+  if(!ev.time) return {date:ev.date, time:"", ms:parseYmd(ev.date).getTime()};
+  const ms = zonedToUtc(ev.date, ev.time, ev.tz || LOCAL_TZ);
+  const p = partsIn(ms, LOCAL_TZ);
+  return {date:p.date, time:p.time, ms};
+}
+
+/* ---------- Writes: one at a time per document, whole-document set ---------- */
+const chains = new Map();
+const timers = new Map();
+function enqueue(path, fn){
+  const prev = chains.get(path) || Promise.resolve();
+  const next = prev.then(fn).catch(e => {
+    console.error(e);
+    if(e && e.code === "quota_exceeded") toast("存储空间已满：删除一些不需要的职位后再试。");
+    else if(e && e.code === "invalid_argument") toast("保存失败：只有这个页面的所有者可以修改数据。");
+    else toast("保存失败，请检查网络后再改一次。");
+  });
+  chains.set(path, next); return next;
+}
+function save(coll, id, delay=0){
+  if(!S.db) return;
+  const path = `${coll}/${id}`;
+  clearTimeout(timers.get(path));
+  const run = () => { timers.delete(path); const doc = S[collKey(coll)].get(id); if(!doc) return;
+    enqueue(path, () => S.db.doc(path).set(JSON.parse(JSON.stringify(doc)))); };
+  if(delay) timers.set(path, setTimeout(run, delay)); else run();
+}
+function flushAll(){ for(const [path, t] of timers){ clearTimeout(t); const [coll,id] = path.split("/"); timers.delete(path); const doc = S[collKey(coll)].get(id); if(doc) enqueue(path, () => S.db.doc(path).set(JSON.parse(JSON.stringify(doc)))); } }
+function remove(coll, id){ clearTimeout(timers.get(`${coll}/${id}`)); S[collKey(coll)].delete(id); if(S.db) enqueue(`${coll}/${id}`, () => S.db.doc(`${coll}/${id}`).delete()); }
+function collKey(c){ return {jobs:"jobs", events:"events", materials:"mats", qa:"qa", meta:"meta"}[c]; }
+function patch(coll, id, p, delay=0){
+  const cur = S[collKey(coll)].get(id) || {};
+  S[collKey(coll)].set(id, {...cur, ...p, updatedAt: nowIso()});
+  save(coll, id, delay);
+}
+window.addEventListener("pagehide", flushAll);
+document.addEventListener("visibilitychange", () => { if(document.hidden) flushAll(); });
+
+/* ---------- Derived ---------- */
+function jobName(j){ return j ? (j.inst || "未命名职位") : "（已删除的职位）"; }
+function jobSub(j){ return [j.dept, j.title, j.city, j.alias && j.alias !== j.inst ? "表格名：" + j.alias : ""].filter(Boolean).join(" · "); }
+function matProgress(j){ const r = j.req || {}; let need = 0, done = 0; for(const k in r){ if(r[k] >= 1){ need++; if(r[k] === 2) done++; } } return [done, need]; }
+function meterHtml(j){ const [d,n] = matProgress(j); if(!n) return `<span class="meter">—</span>`;
+  return `<span class="meter${d===n?" full":""}" title="材料 ${d}/${n}"><i style="--p:${Math.round(d/n*100)}%"></i>${d}/${n}</span>`; }
+function statusPill(k){ const s = ST[k] || ST.watch; return `<span class="pill"><span class="dot" style="background:var(--s-${s.k})"></span>${esc(s.l)}</span>`; }
+function tminus(dl, status){
+  const n = daysUntil(dl);
+  if(n === null) return `<div class="tminus none"><b>—</b><small>未定</small></div>`;
+  const doneish = status && !EARLY.has(status);
+  const md = (d => `${d.getMonth()+1}/${d.getDate()}`)(parseYmd(dl));
+  if(n < 0) return `<div class="tminus past" title="${esc(fmtDate(dl))}"><b>已过</b><small>${md}</small></div>`;
+  const cls = doneish ? "" : n <= 3 ? "urgent" : n <= 10 ? "soon" : "";
+  return `<div class="tminus ${cls}" title="${esc(fmtDate(dl))}"><b>${n === 0 ? "今天" : n + '<span style="font-size:11px;font-weight:500;margin-left:1px">天</span>'}</b><small>${md}</small></div>`;
+}
+const stars = p => p ? `<span class="stars" aria-label="优先级 ${p}">${"★".repeat(p)}</span>` : "";
+const byDeadline = (a,b) => (a[1].deadline || "9999") .localeCompare(b[1].deadline || "9999");
+
+/* ---------- Routing ---------- */
+const VIEWS = ["overview","jobs","calendar","materials","prep","prefs"];
+function setView(v){ S.view = VIEWS.includes(v) ? v : "overview";
+  document.querySelectorAll(".tabs a").forEach(a => a.setAttribute("aria-current", a.dataset.view === S.view ? "page" : "false"));
+  render(); window.scrollTo(0,0); }
+window.addEventListener("hashchange", () => setView(location.hash.slice(1)));
+
+/* ---------- Render ---------- */
+function allLoaded(){ return Object.values(S.loaded).every(Boolean); }
+function render(){
+  const main = $("#main");
+  if(S.denied){ main.innerHTML = `<div class="empty"><strong>这个页面的数据只对所有者开放。</strong>如果你是所有者，请登录后重新打开。</div>`; return; }
+  if(!S.db || !allLoaded()){ return; }
+  const html = ({overview:vOverview, jobs:vJobs, calendar:vCalendar, materials:vMaterials, prep:vPrep, prefs:vPrefs})[S.view]();
+  // Keep focus and caret in text inputs across re-renders
+  const a = document.activeElement; const keep = a && main.contains(a) && a.id ? {id:a.id, s:a.selectionStart, e:a.selectionEnd} : null;
+  main.innerHTML = html;
+  if(keep){ const el = document.getElementById(keep.id); if(el){ el.focus(); try{ el.setSelectionRange(keep.s, keep.e); }catch{} } }
+}
+
+/* Overview */
+function vOverview(){
+  const jobs = [...S.jobs.entries()];
+  const counts = Object.fromEntries(STATUSES.map(s => [s.k, 0]));
+  jobs.forEach(([,j]) => counts[j.status || "watch"]++);
+  const total = jobs.length;
+  const activeTotal = total - counts.rejected - counts.skip;
+
+  const bar = STATUSES.filter(s => counts[s.k]).map(s => `<i style="flex:${counts[s.k]};background:var(--s-${s.k})" title="${esc(s.l)} ${counts[s.k]}"></i>`).join("");
+  const legend = STATUSES.map(s => `<button type="button" data-goto-status="${s.k}" title="${esc(s.d)}"><b>${counts[s.k]}</b><span><span class="dot" style="background:var(--s-${s.k})"></span>${esc(s.l)}</span></button>`).join("");
+
+  const due = jobs.filter(([,j]) => EARLY.has(j.status||"watch") && (daysUntil(j.deadline) ?? -1) >= 0 && daysUntil(j.deadline) <= 21).sort(byDeadline);
+  const dueHtml = due.length ? `<ul class="rows">${due.slice(0,12).map(([id,j]) => `
+      <li class="row" data-open-job="${esc(id)}" tabindex="0">
+        ${tminus(j.deadline, j.status)}
+        <div class="main"><div class="t1">${esc(jobName(j))}</div><div class="t2">${esc(jobSub(j)) || "&nbsp;"}</div></div>
+        <div class="side">${statusPill(j.status)}${meterHtml(j)}</div>
+      </li>`).join("")}</ul>${due.length > 12 ? `<p class="hint" style="padding:0 16px 12px">还有 ${due.length-12} 个，见“职位”页。</p>` : ""}`
+    : `<div class="empty">${total ? "未来三周没有待提交的截止日期。" : "导入职位后，三周内要截止的申请会出现在这里。"}</div>`;
+
+  const now = Date.now();
+  const upcoming = [...S.events.entries()].map(([id,e]) => [id,e,evLocal(e)]).filter(([,,l]) => l.ms >= now - 864e5/2 && l.ms <= now + 45*864e5).sort((a,b) => a[2].ms - b[2].ms);
+  const evHtml = upcoming.length ? `<div style="padding:4px 16px 16px" class="agenda-items">${upcoming.slice(0,8).map(([id,e,l]) => evCard(id,e,l,true)).join("")}</div>`
+    : `<div class="empty">接下来 45 天没有面试或其他日程。<br><button class="btn" type="button" data-new-event>添加日程</button></div>`;
+
+  if(!total) return `
+    <div class="view-head"><div><h1>总览</h1><p>${esc(fmtDate(todayStr()))}</p></div></div>
+    <div class="panel"><div class="empty"><strong>还没有职位</strong>把公众号文章、官网或 EJM 招聘页的文字或截图交给 AI 识别，或者导入 JOE 文件、手动添加。<br>
+      <button class="btn primary" type="button" data-parse>识别招聘信息</button> <button class="btn" type="button" data-import>导入表格</button> <button class="btn" type="button" data-new-job>手动添加</button></div></div>`;
+
+  return `
+    <div class="view-head"><div><h1>总览</h1><p>${esc(fmtDate(todayStr()))} · 跟踪中 ${activeTotal} 个职位</p></div>
+      <div style="display:flex;gap:8px"><button class="btn" type="button" data-new-job>添加职位</button><button class="btn" type="button" data-new-event>添加日程</button></div></div>
+    ${remindersHtml()}
+    ${counts.inbox ? `<div class="panel callout"><div><strong>${counts.inbox} 个新职位待筛选</strong><span>来自检索或识别，看一眼决定关注还是不申请。</span></div><button class="btn primary" type="button" data-goto-status="inbox">开始筛选</button></div>` : ""}
+    <section class="panel pipeline" aria-label="申请进度">
+      <div class="pipe-top"><h2>申请进度</h2><span>共 ${total} 个职位</span></div>
+      <div class="pipe-bar">${bar}</div>
+      <div class="pipe-legend">${legend}</div>
+    </section>
+    <div class="grid2">
+      <section class="panel"><div class="panel-head"><h2>三周内截止</h2><span class="count">还没提交的职位</span></div>${dueHtml}</section>
+      <section class="panel"><div class="panel-head"><h2>接下来的日程</h2><span class="count">时间均为${esc(TZL[LOCAL_TZ] || LOCAL_TZ)}时间</span></div>${evHtml}</section>
+    </div>`;
+}
+
+/* Jobs */
+function lastRunIds(){ const lr = S.meta.get("lastRun"); return lr ? {ids:new Set(lr.addedIds || []), date:lr.date || ""} : {ids:new Set(), date:""}; }
+function isNewJob(id, j){
+  if((j.status || "watch") !== "inbox") return false;
+  const lr = lastRunIds(); if(lr.ids.has(id)) return true;
+  const n = j.foundAt ? daysUntil(j.foundAt) : null; return n !== null && n >= -1;
+}
+function filteredJobs(ignoreStatus){
+  const f = S.jobFilter; const q = f.q.trim().toLowerCase(); const lr = lastRunIds();
+  let list = [...S.jobs.entries()].filter(([id,j]) => {
+    const st = j.status || "watch";
+    if(!ignoreStatus){
+      if(f.status === "active" && CLOSED.has(st)) return false;
+      if(f.status !== "active" && f.status !== "all" && st !== f.status) return false;
+    }
+    if(f.tag && !(j.tags || []).includes(f.tag)) return false;
+    if(f.onlyNew && !(lr.ids.has(id) || (lr.date && j.foundAt === lr.date))) return false;
+    if(q){ const hay = [j.inst,j.alias,j.dept,j.title,j.city,j.loc,j.jel,j.kw,j.notes,j.sheetNote,j.section,j.jobType,j.srcType,j.talentPlan,(j.tags||[]).join(" ")].join(" ").toLowerCase(); if(!hay.includes(q)) return false; }
+    return true;
+  });
+  if(f.sort === "deadline") list.sort((a,b) => { const da = daysUntil(a[1].deadline), db = daysUntil(b[1].deadline);
+      const ka = da === null ? 1e6 : da < 0 ? 5e5 - da : da, kb = db === null ? 1e6 : db < 0 ? 5e5 - db : db; return ka - kb; });
+  if(f.sort === "prio") list.sort((a,b) => (b[1].prio||0) - (a[1].prio||0) || byDeadline(a,b));
+  if(f.sort === "updated") list.sort((a,b) => (b[1].updatedAt||"").localeCompare(a[1].updatedAt||""));
+  if(f.sort === "name") list.sort((a,b) => jobName(a[1]).localeCompare(jobName(b[1])));
+  return list;
+}
+function badges(id, j){ return (isNewJob(id, j) ? '<span class="newmini">新</span>' : "") + (j.tags || []).map(t => `<span class="tagmini">${esc(t)}</span>`).join(""); }
+function dlMini(j){
+  const n = daysUntil(j.deadline); if(n === null) return `<span class="dlmini">${esc(j.deadlineNote ? "长期" : "未定")}</span>`;
+  if(n < 0) return `<span class="dlmini past">已过</span>`;
+  const cls = !EARLY.has(j.status || "watch") ? "" : n <= 3 ? "urgent" : n <= 10 ? "soon" : "";
+  return `<span class="dlmini ${cls}">${n === 0 ? "今天" : n + " 天"}</span>`;
+}
+function vJobs(){
+  const f = S.jobFilter; const kb = S.jobView === "board";
+  const list = filteredJobs(kb);
+  for(const id of [...S.sel]) if(!S.jobs.has(id)) S.sel.delete(id);
+  const opts = [["active","进行中（不含已拒和不申请）"],["all","全部状态"],...STATUSES.map(s => [s.k, s.l])];
+  const head = `
+    <div class="view-head"><div><h1>职位</h1><p>${S.jobs.size} 个职位，当前显示 ${list.length} 个</p></div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn" type="button" data-import>导入表格</button><button class="btn" type="button" data-new-job>手动添加</button><button class="btn primary" type="button" data-parse>识别招聘信息</button></div></div>
+    <div class="toolbar">
+      <div class="seg" role="group" aria-label="显示方式"><button type="button" data-jobview="list" aria-pressed="${!kb}">列表</button><button type="button" data-jobview="board" aria-pressed="${kb}">看板</button></div>
+      <input type="search" id="job-q" placeholder="搜索学校、城市、标签、笔记" value="${esc(f.q)}" aria-label="搜索职位">
+      ${kb ? "" : `<select id="job-status" aria-label="按状态筛选">${opts.map(([k,l]) => `<option value="${k}"${f.status===k?" selected":""}>${esc(l)}</option>`).join("")}</select>`}
+      ${TAGS.length ? `<select id="job-tag" aria-label="按标签筛选"><option value="">所有标签</option>${TAGS.map(t => `<option${f.tag===t?" selected":""}>${esc(t)}</option>`).join("")}</select>` : ""}
+      ${kb ? "" : `<select id="job-sort" aria-label="排序">${[["deadline","按截止日期"],["prio","按优先级"],["updated","按最近修改"],["name","按学校名"]].map(([k,l]) => `<option value="${k}"${f.sort===k?" selected":""}>${l}</option>`).join("")}</select>`}
+      ${f.onlyNew ? `<button class="chip" type="button" data-clear-new aria-pressed="true">只看最近一次检索新增 ✕</button>` : ""}
+    </div>`;
+  if(!S.jobs.size) return head + `<div class="panel"><div class="empty"><strong>还没有职位</strong>导入表格、识别招聘信息或手动添加。<br><button class="btn primary" type="button" data-import>导入表格</button></div></div>`;
+  if(kb) return head + vBoard(list);
+  const allSel = list.length && list.every(([id]) => S.sel.has(id));
+  const rows = list.map(([id,j]) => `
+    <tr data-open-job="${esc(id)}" tabindex="0"${S.sel.has(id) ? ' class="selected"' : ""}>
+      <td class="selcell"><input type="checkbox" data-sel="${esc(id)}"${S.sel.has(id) ? " checked" : ""} aria-label="选择 ${esc(jobName(j))}"></td>
+      <td class="tm">${tminus(j.deadline, j.status)}</td>
+      <td><div class="inst cell-clip">${esc(jobName(j))}${badges(id, j)}</div><div class="sub cell-clip">${esc(jobSub(j)) || "&nbsp;"}</div></td>
+      <td class="c-status">${(j.status||"watch") === "inbox" ? `<span class="triage"><button class="btn sm" type="button" data-triage="watch" data-id="${esc(id)}">关注</button><button class="btn sm ghost" type="button" data-triage="skip" data-id="${esc(id)}">不申请</button></span>` : statusPill(j.status)}</td>
+      <td class="c-mat">${meterHtml(j)}</td>
+      <td class="c-prio">${stars(j.prio) || '<span class="sub">—</span>'}</td>
+    </tr>`).join("");
+  return head + `
+    <div class="panel" style="overflow-x:auto">
+      ${list.length ? `<table class="jobs-table"><thead><tr><th class="selcell"><input type="checkbox" id="sel-all"${allSel ? " checked" : ""} aria-label="全选当前列表"></th><th>截止</th><th>学校 / 职位</th><th>状态</th><th>材料</th><th>优先级</th></tr></thead><tbody>${rows}</tbody></table>`
+        : `<div class="empty">没有符合筛选条件的职位。</div>`}
+    </div>
+    ${S.sel.size ? `<div class="bulkbar" role="region" aria-label="批量操作">
+      <b>已选 ${S.sel.size} 个</b>
+      <select data-bulk="status" aria-label="批量改状态"><option value="">改状态…</option>${STATUSES.map(x => `<option value="${x.k}">${esc(x.l)}</option>`).join("")}</select>
+      <select data-bulk="prio" aria-label="批量改优先级"><option value="">改优先级…</option>${[3,2,1,0].map(p => `<option value="${p}">${p ? "★".repeat(p) : "清除"}</option>`).join("")}</select>
+      ${TAGS.length ? `<select data-bulk="tag" aria-label="批量加标签"><option value="">加标签…</option>${TAGS.map(t => `<option>${esc(t)}</option>`).join("")}</select>` : ""}
+      <button class="btn sm danger" type="button" data-bulk-del>删除</button>
+      <button class="btn sm ghost" type="button" data-bulk-clear>取消选择</button>
+    </div>` : ""}`;
+}
+function vBoard(list){
+  const by = Object.fromEntries(STATUSES.map(x => [x.k, []]));
+  list.forEach(([id, j]) => (by[j.status || "watch"] || by.watch).push([id, j]));
+  const col = x => {
+    const items = by[x.k]; const closed = CLOSED.has(x.k) && !S.kbClosed;
+    return `<section class="kcol${closed ? " folded" : ""}" data-col="${x.k}" aria-label="${esc(x.l)}">
+      <header class="khead"><span class="dot" style="background:var(--s-${x.k})"></span><b>${esc(x.l)}</b><span class="kcount">${items.length}</span>
+        ${CLOSED.has(x.k) ? `<button class="btn ghost sm" type="button" data-kb-fold>${closed ? "展开" : "收起"}</button>` : ""}</header>
+      ${closed ? "" : `<div class="kbody">${items.map(([id, j]) => `
+        <article class="kcard" draggable="true" data-card="${esc(id)}" data-open-job="${esc(id)}" tabindex="0">
+          <div class="kc-top"><span class="kc-inst">${esc(jobName(j))}</span>${dlMini(j)}</div>
+          ${j.dept || j.title ? `<div class="kc-sub">${esc([j.dept, j.city].filter(Boolean).join(" · "))}</div>` : ""}
+          <div class="kc-foot">${meterHtml(j)}${stars(j.prio)}${badges(id, j)}</div>
+          <select class="kc-move" data-move="${esc(id)}" aria-label="把 ${esc(jobName(j))} 移到"><option value="">移到…</option>${STATUSES.filter(y => y.k !== x.k).map(y => `<option value="${y.k}">${esc(y.l)}</option>`).join("")}</select>
+        </article>`).join("") || `<div class="kempty">拖到这里</div>`}</div>`}
+    </section>`;
+  };
+  return `<p class="hint" style="margin:-4px 0 10px">拖动卡片到另一列即可改状态；手机上用卡片底部的“移到…”。</p><div class="kanban">${STATUSES.map(col).join("")}</div>`;
+}
+function setStatusMany(ids, st){
+  ids.forEach(id => { if(S.jobs.has(id) && (S.jobs.get(id).status || "watch") !== st) patch("jobs", id, {status:st}); });
+}
+
+/* Calendar */
+function evCard(id, e, l, showDate){
+  const j = e.jobId ? S.jobs.get(e.jobId) : null; const t = EVT[e.type] || EVT.other;
+  const other = e.time && e.tz && e.tz !== LOCAL_TZ ? `<span>${esc(TZL[e.tz] || e.tz)} ${esc(e.time)}</span>` : "";
+  return `<div class="ev" data-edit-event="${esc(id)}" tabindex="0">
+    <span class="bar" style="background:${t.c}"></span>
+    <div><div class="t1">${esc(t.l)}${j ? " · " + esc(jobName(j)) : (e.title ? " · " + esc(e.title) : "")}</div>
+      <div class="t2">${esc([e.format, e.place].filter(Boolean).join(" · ")) || "&nbsp;"}</div></div>
+    <div class="when">${showDate ? `<b>${esc(fmtDate(l.date))}</b>` : ""}${l.time ? `<b${showDate?' style="font-size:13px;font-weight:500"':''}>${esc(l.time)}</b>` : `<span>全天</span>`}${other}</div>
+  </div>`;
+}
+function shortName(j){ return j ? (j.alias || jobName(j)) : ""; }
+function calItems(){
+  const out = [];
+  for(const [id,e] of S.events){ const l = evLocal(e); if(!l.date) continue; const j = e.jobId ? S.jobs.get(e.jobId) : null; const t = EVT[e.type] || EVT.other;
+    out.push({date:l.date, ms:l.ms, chip:`${l.time ? l.time + " " : ""}${t.l}${j ? " " + shortName(j) : (e.title ? " " + e.title : "")}`, color:t.c, html:evCard(id,e,l,false)}); }
+  if(S.calDeadlines) for(const [id,j] of S.jobs){ if(!j.deadline || CLOSED.has(j.status||"watch")) continue;
+    const early = EARLY.has(j.status || "watch");
+    out.push({date:j.deadline, ms:parseYmd(j.deadline).getTime()+1, chip:`截止 ${shortName(j)}`, color: early ? "var(--urgent)" : "var(--faint)", dl:true,
+      html:`<div class="ev" data-open-job="${esc(id)}" tabindex="0"><span class="bar" style="background:${early ? "var(--urgent)" : "var(--line)"}"></span>
+      <div><div class="t1">申请截止 · ${esc(jobName(j))}</div><div class="t2">${esc(jobSub(j)) || "&nbsp;"}</div></div><div class="when">${statusPill(j.status)}${meterHtml(j)}</div></div>`}); }
+  return out.sort((a,b) => a.ms - b.ms);
+}
+function vCalendar(){
+  const today = todayStr(); const items = calItems(); const month = S.calMode === "month";
+  const head = `
+    <div class="view-head"><div><h1>日程</h1><p>时间按你所在的${esc(TZL[LOCAL_TZ] || LOCAL_TZ)}时间显示</p></div>
+      <button class="btn primary" type="button" data-new-event>添加日程</button></div>
+    <div class="toolbar">
+      <div class="seg" role="group" aria-label="显示方式"><button type="button" data-calmode="month" aria-pressed="${month}">月历</button><button type="button" data-calmode="agenda" aria-pressed="${!month}">列表</button></div>
+      <label class="chip" style="display:inline-flex;gap:6px;align-items:center"><input type="checkbox" id="cal-dl"${S.calDeadlines?" checked":""}> 显示申请截止</label>
+      ${month ? "" : `<label class="chip" style="display:inline-flex;gap:6px;align-items:center"><input type="checkbox" id="cal-past"${S.calPast?" checked":""}> 显示过去的（${items.filter(it => it.date < today).length}）</label>`}
+    </div>`;
+  if(month){
+    if(!S.calMonth) S.calMonth = today.slice(0,7);
+    const [y, m] = S.calMonth.split("-").map(Number);
+    const first = new Date(y, m-1, 1); const offset = (first.getDay() + 6) % 7; const start = new Date(y, m-1, 1 - offset);
+    const byDay = {}; items.forEach(it => (byDay[it.date] ||= []).push(it));
+    if(!S.calDay || S.calDay.slice(0,7) !== S.calMonth) S.calDay = today.slice(0,7) === S.calMonth ? today : `${S.calMonth}-01`;
+    let cells = "";
+    for(let i = 0; i < 42; i++){
+      const d = new Date(start.getFullYear(), start.getMonth(), start.getDate() + i); const ds = ymd(d); const its = byDay[ds] || [];
+      cells += `<button type="button" class="mday${d.getMonth() !== m-1 ? " out" : ""}${ds === today ? " today" : ""}${ds === S.calDay ? " picked" : ""}" data-day="${ds}" aria-label="${esc(fmtDate(ds))}，${its.length} 项">
+        <span class="mnum">${d.getDate()}</span>
+        <span class="mchipz">${its.slice(0,3).map(it => `<span class="mc" style="--c:${it.color}">${esc(it.chip)}</span>`).join("")}${its.length > 3 ? `<span class="mmore">+${its.length - 3}</span>` : ""}</span>
+        ${its.length ? `<span class="mdots">${its.slice(0,4).map(it => `<i style="background:${it.color}"></i>`).join("")}</span>` : ""}
+      </button>`;
+    }
+    const dayItems = byDay[S.calDay] || [];
+    return head + `
+      <div class="panel month">
+        <div class="mhead"><button class="btn ghost" type="button" data-cal-nav="-1" aria-label="上个月">‹</button><h2>${y} 年 ${m} 月</h2><button class="btn ghost" type="button" data-cal-nav="1" aria-label="下个月">›</button><button class="btn sm" type="button" data-cal-nav="0">今天</button></div>
+        <div class="mgrid"><div class="mw">一</div><div class="mw">二</div><div class="mw">三</div><div class="mw">四</div><div class="mw">五</div><div class="mw">六</div><div class="mw">日</div>${cells}</div>
+      </div>
+      <div class="panel" style="margin-top:16px"><div class="panel-head"><h2>${esc(fmtDate(S.calDay))}</h2><button class="btn sm" type="button" data-new-event-day="${S.calDay}">在这天添加日程</button></div>
+        ${dayItems.length ? `<div class="agenda-items" style="padding:0 16px 16px">${dayItems.map(i => i.html).join("")}</div>` : `<div class="empty" style="padding:16px">这天没有截止日期或日程。</div>`}</div>`;
+  }
+  const shown = items.filter(it => S.calPast ? true : it.date >= today);
+  const groups = []; for(const it of shown){ const g = groups[groups.length-1]; if(g && g.date === it.date) g.items.push(it); else groups.push({date:it.date, items:[it]}); }
+  const body = groups.length ? groups.map(g => { const n = daysUntil(g.date);
+      return `<div class="agenda-day"><div class="agenda-date${n===0?" today":""}"><b>${esc(fmtDate(g.date,false))}</b><span>${WD[parseYmd(g.date).getDay()]}${n===0?" · 今天":n===1?" · 明天":n>1?` · ${n} 天后`:""}</span></div>
+        <div class="agenda-items">${g.items.map(i => i.html).join("")}</div></div>`; }).join("")
+    : `<div class="empty"><strong>没有即将到来的日程</strong>添加初面、校园面试或 offer 答复截止日期，时区会自动换算。<br><button class="btn primary" type="button" data-new-event>添加日程</button></div>`;
+  return head + `<div class="panel">${body}</div>`;
+}
+
+/* Reminders shown on the overview */
+function dismissedSet(){ try { return new Set(JSON.parse(localStorage.getItem("jd-dismiss-" + todayStr()) || "[]")); } catch { return new Set(); } }
+function dismiss(key){ const d = dismissedSet(); d.add(key); lsSet("jd-dismiss-" + todayStr(), JSON.stringify([...d])); }
+function reminders(){
+  const out = []; const dis = dismissedSet(); const now = Date.now();
+  const lr = S.meta.get("lastRun");
+  if(lr && lr.date && daysUntil(lr.date) >= -1){
+    if(lr.added) out.push({key:"run-" + lr.date, lvl:"info", text:`${daysUntil(lr.date) === 0 ? "今早" : "昨天"}的自动检索新增 ${lr.added} 个职位${lr.summary ? "：" + lr.summary : ""}`, act:`<button class="btn sm" type="button" data-show-new>查看</button>`});
+    if(lr.issues) out.push({key:"runissue-" + lr.date, lvl:"soon", text:`自动检索遇到问题：${lr.issues}`, act:""});
+  }
+  for(const [id, j] of S.jobs){
+    const st = j.status || "watch"; if(!EARLY.has(st)) continue; const n = daysUntil(j.deadline); if(n === null || n < 0) continue;
+    const [d, k] = matProgress(j); const when = n === 0 ? "今天" : n === 1 ? "明天" : n === 2 ? "后天" : `${n} 天后`;
+    const open = `<button class="btn sm" type="button" data-open-job="${esc(id)}">打开</button>`;
+    if(n <= 3 && st === "prep" && d < k) out.push({key:"mat-" + id, lvl:"urgent", text:`${jobName(j)}${j.dept ? " " + j.dept : ""} ${when}截止，材料还差 ${k - d} 项`, act:open, sort:n});
+    else if(n <= 3 && st === "prep") out.push({key:"sub-" + id, lvl:"urgent", text:`${jobName(j)}${j.dept ? " " + j.dept : ""} ${when}截止，材料已齐，提交后把状态改成“已提交”`, act:open, sort:n});
+    else if(n <= 7 && (st === "inbox" || st === "watch")) out.push({key:"dec-" + id, lvl: n <= 3 ? "urgent" : "soon", text:`${jobName(j)}${j.dept ? " " + j.dept : ""} ${when}截止，还没决定是否申请`, act:open, sort:n});
+  }
+  for(const [id, e] of S.events){
+    const l = evLocal(e); if(!isFinite(l.ms) || l.ms < now - 3600e3 || l.ms > now + 48 * 3600e3) continue;
+    const j = e.jobId ? S.jobs.get(e.jobId) : null; const n = daysUntil(l.date);
+    out.push({key:"ev-" + id, lvl:"soon", text:`${n === 0 ? "今天" : n === 1 ? "明天" : n === 2 ? "后天" : fmtDate(l.date)}${l.time ? " " + l.time : ""} ${(EVT[e.type] || EVT.other).l}${j ? " · " + jobName(j) : (e.title ? " · " + e.title : "")}`, act:`<button class="btn sm" type="button" data-edit-event="${esc(id)}">查看</button>`, sort:-1});
+  }
+  return out.filter(r => !dis.has(r.key)).sort((a, b) => (a.sort ?? -2) - (b.sort ?? -2));
+}
+function remindersHtml(){
+  const rs = reminders(); if(!rs.length) return "";
+  return `<section class="panel reminders" aria-label="提醒"><div class="panel-head"><h2>提醒</h2><span class="count">${rs.length} 条</span></div>
+    <ul class="rlist">${rs.slice(0, 8).map(r => `<li class="r-${r.lvl}"><span class="rtext">${esc(r.text)}</span><span class="ract">${r.act}<button class="btn ghost sm" type="button" data-dismiss="${esc(r.key)}" aria-label="今天不再提醒">✕</button></span></li>`).join("")}</ul>
+    ${rs.length > 8 ? `<p class="hint" style="padding:0 16px 12px;margin:0">还有 ${rs.length - 8} 条，先处理上面的。</p>` : ""}</section>`;
+}
+
+/* Materials */
+function vMaterials(){
+  const groups = MAT_KINDS.map(k => [k, [...S.mats.entries()].filter(([,m]) => (m.kind||"其他") === k).sort((a,b) => (b[1].date||"").localeCompare(a[1].date||""))]).filter(([,l]) => l.length);
+  const body = groups.length ? groups.map(([k,l]) => `<div class="kind-group"><h3>${esc(k)}</h3>${l.map(([id,m]) => {
+      const used = (m.jobIds||[]).map(x => S.jobs.get(x)).filter(Boolean).map(jobName);
+      return `<div class="mat" data-edit-mat="${esc(id)}" tabindex="0"><div style="min-width:0"><div class="t1">${esc(m.label || "未命名版本")}</div>
+        <div class="t2">${used.length ? "用于 " + esc(used.join("、")) : "还没有关联职位"}${m.link ? " · " + esc(host(m.link)) : ""}</div></div>
+        <span class="status-line">${esc(m.date ? fmtDate(m.date,false) : "")}</span></div>`; }).join("")}</div>`).join("")
+    : `<div class="empty"><strong>还没有材料版本</strong>为每份研究计划、中文简历、求职信等记录一个版本：放 Overleaf 或网盘链接，并标明发给了哪些学校。<br><button class="btn primary" type="button" data-new-mat>添加版本</button></div>`;
+  return `
+    <div class="view-head"><div><h1>材料</h1><p>各份申请材料的版本，以及每个版本发给了哪些学校</p></div>
+      <button class="btn primary" type="button" data-new-mat>添加版本</button></div>
+    <div class="panel">${body}</div>`;
+}
+
+/* Prep */
+function vPrep(){
+  const cats = ["全部", ...QA_CATS];
+  const list = [...S.qa.entries()].filter(([,x]) => S.qaCat === "全部" || x.cat === S.qaCat).sort((a,b) => (a[1].createdAt||"").localeCompare(b[1].createdAt||""));
+  const lv = ["未准备","有草稿","熟练"];
+  const counts = [0,0,0]; [...S.qa.values()].forEach(x => counts[x.level||0]++);
+  const body = list.length ? list.map(([id,x]) => { const j = x.jobId ? S.jobs.get(x.jobId) : null; return `
+    <details class="qa" data-qa="${esc(id)}"${S.openQa === id ? " open" : ""}>
+      <summary><div class="q">${esc(x.q || "新问题")}<small>${esc(x.cat || "通用")}${j ? " · " + esc(jobName(j)) : ""}</small></div><span class="lvl-tag lvl-${x.level||0}">${lv[x.level||0]}</span></summary>
+      <div class="body">
+        <label class="field"><span>问题</span><input type="text" id="qa-q-${esc(id)}" data-qa-field="q" value="${esc(x.q)}"></label>
+        <label class="field"><span>你的回答要点</span><textarea rows="5" id="qa-a-${esc(id)}" data-qa-field="a" placeholder="写要点，不用写成稿。面试时你只会记得结构。">${esc(x.a)}</textarea></label>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;justify-content:space-between">
+          <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+            <div class="lvl" role="group" aria-label="熟练程度">${lv.map((l,i) => `<button type="button" data-qa-level="${i}" aria-pressed="${(x.level||0)===i}">${l}</button>`).join("")}</div>
+            <select data-qa-field="cat" aria-label="类别" style="width:auto">${QA_CATS.map(c => `<option${c===x.cat?" selected":""}>${esc(c)}</option>`).join("")}</select>
+            <select data-qa-field="jobId" aria-label="针对的学校" style="width:auto;max-width:220px"><option value="">适用于所有学校</option>${jobOptions(x.jobId)}</select>
+          </div>
+          <button class="btn danger" type="button" data-del-qa>删除</button>
+        </div>
+      </div>
+    </details>`; }).join("")
+    : `<div class="empty">${S.qa.size ? "这个类别下还没有问题。" : "<strong>题库是空的</strong>添加你预计会被问到的问题，以及想问对方的问题。"}</div>`;
+  return `
+    <div class="view-head"><div><h1>面试准备</h1><p>${S.qa.size} 个问题：熟练 ${counts[2]}，有草稿 ${counts[1]}，未准备 ${counts[0]}</p></div>
+      <button class="btn primary" type="button" data-new-qa>添加问题</button></div>
+    <div class="toolbar"><div class="cats" role="group" aria-label="类别">${cats.map(c => `<button type="button" class="chip" data-qa-cat="${esc(c)}" aria-pressed="${S.qaCat===c}">${esc(c)}</button>`).join("")}</div></div>
+    <div class="panel">${body}</div>`;
+}
+function jobOptions(sel){
+  return [...S.jobs.entries()].filter(([id,j]) => !CLOSED.has(j.status||"watch") || id === sel).sort((a,b) => jobName(a[1]).localeCompare(jobName(b[1])))
+    .map(([id,j]) => `<option value="${esc(id)}"${id===sel?" selected":""}>${esc(jobName(j))}${j.dept ? " · " + esc(j.dept) : ""}</option>`).join("");
+}
+
+
+/* Settings */
+function curSettings(){ return {materials:MATS.map(m => ({...m})), qaCats:[...QA_CATS], tags:[...TAGS]}; }
+function saveSettings(next){ S.meta.set("settings", {...next, updatedAt:nowIso()}); applySettings(); save("meta", "settings", 500); }
+function listEditor(kind, items, label){
+  return `<div class="ed-list" data-list="${kind}">${items.map((it, i) => `
+    <div class="ed-row" data-i="${i}">
+      <input type="text" id="ed-${kind}-${i}" data-ed-label value="${esc(kind === "materials" ? it.l : it)}" data-old="${esc(kind === "materials" ? it.l : it)}" aria-label="${esc(label)} ${i+1}">
+      ${kind === "materials" ? `<label class="ed-def"><input type="checkbox" data-ed-def${it.def ? " checked" : ""}> 新职位默认需要</label>` : ""}
+      <button class="btn ghost sm" type="button" data-ed-up${i === 0 ? " disabled" : ""} aria-label="上移">上移</button>
+      <button class="btn ghost sm danger" type="button" data-ed-del>删除</button>
+    </div>`).join("")}
+    <form class="ed-add" data-ed-add="${kind}"><input type="text" placeholder="添加${esc(label)}" aria-label="添加${esc(label)}" required><button class="btn sm" type="submit">添加</button></form>
+  </div>`;
+}
+function vPrefs(){
+  const pr = S.meta.get("prefs") || {}; const lr = S.meta.get("lastRun");
+  const lines = a => esc((Array.isArray(a) ? a : []).join("\n"));
+  const lrHtml = lr ? `<div class="runlog">
+      <div><b>${esc(fmtDate((lr.date || (lr.at || "").slice(0,10))))}</b> <span class="status-line">${lr.at ? esc(new Date(lr.at).toLocaleTimeString("zh-CN", {hour:"2-digit", minute:"2-digit"})) : ""}</span></div>
+      <div>新增 <b>${lr.added || 0}</b> 个职位${lr.checked ? `，核实了 ${lr.checked} 个` : ""}</div>
+      ${lr.summary ? `<p class="hint" style="margin:4px 0 0">${esc(lr.summary)}</p>` : ""}
+      ${lr.issues ? `<p class="hint" style="margin:4px 0 0;color:var(--soon)">问题：${esc(lr.issues)}</p>` : ""}
+      ${lr.added ? `<button class="btn sm" type="button" data-show-new style="margin-top:8px">查看这次新增的职位</button>` : ""}
+    </div>` : `<p class="hint" style="margin:0">还没有运行记录。每日检索由 GitHub Actions 在北京时间 7:35 运行，第一次运行后这里会显示结果。</p>`;
+  return `
+    <div class="view-head"><div><h1>设置</h1><p>改动自动保存，所有设备同步</p></div></div>
+    <div class="prefs-grid">
+      ${window.__ghPanel ? window.__ghPanel() : ""}
+      <section class="panel pad">
+        <h2 class="ph">每日检索</h2>
+        <p class="hint" style="margin:0 0 12px">每天北京时间 7:35 自动检索中国大陆和澳门的经济学、金融教职，新职位进入“待筛选”。下面的偏好会在下一次检索时生效。</p>
+        <div class="pref-fields">
+          <label class="field"><span>研究领域（帮助判断哪些岗位更相关）</span><input type="text" id="pf-fields" data-pref="fields" value="${esc(pr.fields || "")}" placeholder="如：产业组织、数字经济、法经济学"></label>
+          <label class="field"><span>额外关键词（每行一个）</span><textarea id="pf-keywords" data-pref="keywords" rows="3" placeholder="如：数字经济&#10;平台经济">${lines(pr.keywords)}</textarea></label>
+          <label class="field"><span>重点关注的学校（每行一个，会专门去它们官网查）</span><textarea id="pf-extra" data-pref="extraSchools" rows="3" placeholder="如：北京大学经济学院&#10;南开大学经济学院">${lines(pr.extraSchools)}</textarea></label>
+          <label class="field"><span>不要的学校（每行一个）</span><textarea id="pf-exclude" data-pref="excludeSchools" rows="2">${lines(pr.excludeSchools)}</textarea></label>
+        </div>
+        <h3 class="ph3">上次检索</h3>
+        ${lrHtml}
+      </section>
+      <section class="panel pad">
+        <h2 class="ph">要求的材料</h2>
+        <p class="hint" style="margin:0 0 12px">职位详情里的材料清单。勾选“新职位默认需要”的，新加入的职位会自动标为需要。</p>
+        ${listEditor("materials", MATS, "材料")}
+      </section>
+      <section class="panel pad">
+        <h2 class="ph">标签</h2>
+        <p class="hint" style="margin:0 0 12px">在职位详情里给职位打标签，职位页可以按标签筛选。改名会同步到已打标签的职位。</p>
+        ${listEditor("tags", TAGS, "标签")}
+      </section>
+      <section class="panel pad">
+        <h2 class="ph">面试题分类</h2>
+        <p class="hint" style="margin:0 0 12px">改名会同步到这一类下的题目；删除分类后，原来的题目归到“通用”。</p>
+        ${listEditor("qaCats", QA_CATS, "分类")}
+      </section>
+      <section class="panel pad">
+        <h2 class="ph">数据</h2>
+        <p class="hint" style="margin:0 0 12px">${S.jobs.size} 个职位、${S.events.size} 个日程、${S.mats.size} 个材料版本、${S.qa.size} 道面试题。删除这个页面会同时清空数据，建议定期导出备份。</p>
+        ${S.downloads ? `<button class="btn" type="button" data-export>导出备份（JSON）</button>` : `<p class="hint" style="margin:0">这个视图不能保存文件。</p>`}
+      </section>
+    </div>`;
+}
+function editList(kind, fn){
+  const st = curSettings(); fn(st[kind], st); saveSettings(st); render();
+}
+function renameRef(kind, oldV, newV){
+  if(!oldV || oldV === newV) return;
+  if(kind === "tags") for(const [id, j] of S.jobs){ if((j.tags || []).includes(oldV)) patch("jobs", id, {tags:j.tags.map(t => t === oldV ? newV : t)}); }
+  if(kind === "qaCats") for(const [id, x] of S.qa){ if(x.cat === oldV) patch("qa", id, {cat:newV}); }
+}
+function savePref(field, raw){
+  const pr = {...(S.meta.get("prefs") || {})};
+  pr[field] = field === "fields" ? raw.trim() : raw.split("\n").map(x => x.trim()).filter(Boolean);
+  pr.updatedAt = nowIso(); S.meta.set("prefs", pr); save("meta", "prefs", 600);
+}
+
+/* ---------- Drawer: one job ---------- */
+function openJob(id){ S.drawerJob = id; renderDrawer(true); }
+function closeDrawer(){ flushAll(); S.drawerJob = null; $("#drawer-root").innerHTML = ""; render(); }
+function renderDrawer(first){
+  const root = $("#drawer-root"); const id = S.drawerJob; const j = S.jobs.get(id);
+  if(!id || !j){ root.innerHTML = ""; return; }
+  const scroll = root.querySelector(".drawer-body")?.scrollTop || 0;
+  const a = document.activeElement; const keepId = a && root.contains(a) ? a.id : null;
+  const req = j.req || {};
+  const evs = [...S.events.entries()].filter(([,e]) => e.jobId === id).map(([eid,e]) => [eid,e,evLocal(e)]).sort((a,b) => a[2].ms - b[2].ms);
+  const mats = [...S.mats.entries()].filter(([,m]) => (m.jobIds||[]).includes(id));
+  const joeUrl = j.joeId ? (j.joeIssue ? `https://www.aeaweb.org/joe/listing.php?JOE_ID=${encodeURIComponent(j.joeIssue)}_${encodeURIComponent(j.joeId)}` : `https://www.aeaweb.org/joe/listings`) : "";
+  root.innerHTML = `
+    <div class="scrim" data-close-drawer></div>
+    <aside class="drawer" role="dialog" aria-modal="true" aria-label="${esc(jobName(j))}">
+      <div class="drawer-head"><span class="crumb">${esc(j.srcType || (j.source === "joe" ? "JOE" : j.source === "sheet" ? "表格导入" : "手动添加"))}${j.updatedAt ? " · 修改于 " + esc(fmtDate(j.updatedAt.slice(0,10),false)) : ""}</span>
+        <button class="btn ghost" type="button" data-close-drawer aria-label="关闭">关闭</button></div>
+      <div class="drawer-body">
+        <div>
+          <input class="big-input" type="text" id="j-inst" data-jf="inst" value="${esc(j.inst)}" placeholder="学校或机构" aria-label="学校或机构">
+          <input class="sub-input" type="text" id="j-dept" data-jf="dept" value="${esc(j.dept)}" placeholder="院系" aria-label="院系">
+          <input class="sub-input" type="text" id="j-title" data-jf="title" value="${esc(j.title)}" placeholder="职位名称，如 Assistant Professor" aria-label="职位名称">
+        </div>
+        <div class="fgrid">
+          <label class="field"><span>状态</span><select id="j-status" data-jf="status">${STATUSES.map(s => `<option value="${s.k}"${(j.status||"watch")===s.k?" selected":""}>${esc(s.l)}</option>`).join("")}</select></label>
+          <label class="field"><span>申请截止</span><input type="date" id="j-deadline" data-jf="deadline" value="${esc(j.deadline)}"></label>
+          <label class="field"><span>优先级</span><select id="j-prio" data-jf="prio">${[0,1,2,3].map(p => `<option value="${p}"${(j.prio||0)===p?" selected":""}>${p ? "★".repeat(p) : "未设置"}</option>`).join("")}</select></label>
+          <label class="field"><span>岗位类型</span><select id="j-jobType" data-jf="jobType">${JOB_TYPES.map(p => `<option value="${esc(p)}"${(j.jobType||"")===p?" selected":""}>${p ? esc(p) : "未设置"}</option>`).join("")}</select></label>
+          <label class="field"><span>城市</span><input type="text" id="j-city" data-jf="city" value="${esc(j.city)}" placeholder="如：上海"></label>
+          <label class="field"><span>信息来源</span><select id="j-srcType" data-jf="srcType">${SOURCES.map(p => `<option value="${esc(p)}"${(j.srcType||"")===p?" selected":""}>${p ? esc(p) : "未设置"}</option>`).join("")}</select></label>
+          <label class="field"><span>申请方式</span><select id="j-portal" data-jf="portal">${PORTALS.map(p => `<option value="${esc(p)}"${(j.portal||"")===p?" selected":""}>${p ? esc(p) : "未设置"}</option>`).join("")}</select></label>
+          <label class="field wide"><span>截止说明</span><input type="text" id="j-deadlineNote" data-jf="deadlineNote" value="${esc(j.deadlineNote)}" placeholder="如：长期有效，招满为止；12 月起分批面试"></label>
+          <label class="field wide"><span>招聘页面</span><input type="url" id="j-url" data-jf="url" value="${esc(j.url)}" placeholder="https://"></label>
+          <label class="field wide"><span>申请入口</span><input type="url" id="j-applyUrl" data-jf="applyUrl" value="${esc(j.applyUrl)}" placeholder="网申系统、Interfolio 等"></label>
+          <label class="field"><span>联系方式</span><input type="text" id="j-contact" data-jf="contact" value="${esc(j.contact)}" placeholder="邮箱或联系人"></label>
+          <label class="field wide"><span>人才计划</span><input type="text" id="j-talentPlan" data-jf="talentPlan" value="${esc(j.talentPlan)}" placeholder="如：可依托申报海外优青；学校青年人才计划"></label>
+          <label class="field"><span>岗位来源记录</span><input type="text" value="${esc(j.source === "joe" ? "JOE 导入" : j.source === "search" ? "自动检索" : j.source === "parsed" ? "AI 识别" : j.source === "sheet" ? "表格导入" : "手动添加")}" disabled></label>
+        </div>
+        ${(j.url || joeUrl || j.applyUrl) ? `<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:-8px">${j.applyUrl ? `<a class="btn primary" href="${esc(j.applyUrl)}" target="_blank" rel="noopener">打开申请入口</a>` : ""}${j.url ? `<a class="btn" href="${esc(j.url)}" target="_blank" rel="noopener">打开招聘页面</a>` : ""}${joeUrl && joeUrl !== j.url ? `<a class="btn" href="${esc(joeUrl)}" target="_blank" rel="noopener">在 JOE 查看</a>` : ""}</div>` : ""}
+        <div class="f2">
+          <label class="field"><span>待遇（年薪、安家费、启动经费、住房）</span><textarea id="j-pay" data-jf="pay" rows="3">${esc(j.pay)}</textarea></label>
+          <label class="field"><span>考核要求（预聘期、发表、教学量）</span><textarea id="j-assess" data-jf="assess" rows="3">${esc(j.assess)}</textarea></label>
+        </div>
+        ${TAGS.length ? `<div><div class="sec-title">标签</div><div class="mchips">${TAGS.map(t => `<button type="button" class="tagchip" data-tag="${esc(t)}" aria-pressed="${(j.tags || []).includes(t)}">${esc(t)}</button>`).join("")}</div></div>` : ""}
+        <div>
+          <div class="sec-title">要求的材料<span>${matProgress(j)[0]}/${matProgress(j)[1]} 已完成</span></div>
+          <div class="mchips">${MATS.map(m => `<button type="button" class="mchip" id="mc-${m.k}" data-mat="${m.k}" data-s="${req[m.k]||0}" aria-label="${esc(m.l)}：${["不需要","需要，未完成","已完成"][req[m.k]||0]}">${esc(m.l)}</button>`).join("")}</div>
+          <p class="hint">点一下切换：虚线 = 不需要，实线 = 需要，绿色 = 已完成。</p>
+        </div>
+        ${j.sheetNote ? `<div><div class="sec-title">来自你的表格${j.alias ? `（${esc(j.alias)}）` : ""}</div><div class="fulltext" style="margin-top:0;max-height:none">${linkify(j.sheetNote)}</div></div>` : ""}
+        <label class="field"><span>院校调研笔记</span><textarea id="j-notes" data-jf="notes" rows="7" placeholder="学院里做相关领域的老师、为什么匹配、学院近年招聘和晋升情况、要提前联系的人、求职信里要提到的点…">${esc(j.notes)}</textarea></label>
+        <div>
+          <div class="sec-title">日程<button class="btn" type="button" data-new-event="${esc(id)}">添加日程</button></div>
+          ${evs.length ? `<div class="minilist">${evs.map(([eid,e,l]) => `<div class="miniitem" data-edit-event="${esc(eid)}" tabindex="0"><b>${esc((EVT[e.type]||EVT.other).l)}</b><span>${esc(fmtDate(l.date))}${l.time ? " " + esc(l.time) : ""}</span></div>`).join("")}</div>` : `<p class="hint" style="margin:0">还没有这个职位的面试日程。</p>`}
+        </div>
+        <div>
+          <div class="sec-title">发出的材料版本<button class="btn" type="button" data-new-mat="${esc(id)}">记录版本</button></div>
+          ${mats.length ? `<div class="minilist">${mats.map(([mid,m]) => `<div class="miniitem" data-edit-mat="${esc(mid)}" tabindex="0"><b>${esc(m.kind)}：${esc(m.label || "未命名")}</b><span>${esc(m.date ? fmtDate(m.date,false) : "")}</span></div>`).join("")}</div>` : `<p class="hint" style="margin:0">还没有记录发给这个学校的材料版本。</p>`}
+        </div>
+        ${(j.section || j.loc || j.jel || j.kw) ? `<div class="metaline">${j.section ? `<span>${esc(j.section)}</span>` : ""}${j.loc ? `<span>${esc(j.loc)}</span>` : ""}${j.jel ? `<span>JEL：${esc(j.jel)}</span>` : ""}${j.kw ? `<span>方向：${esc(j.kw)}</span>` : ""}</div>` : ""}
+        ${j.full ? `<details><summary class="sec-title" style="display:inline">招聘原文</summary><div class="fulltext">${esc(j.full)}</div></details>` : ""}
+        <div style="border-top:1px solid var(--line);padding-top:16px;display:flex;gap:8px;flex-wrap:wrap">${S.sample ? `<button class="btn" type="button" data-ai-job="${esc(id)}">问 AI 关于这个职位</button>` : ""}<button class="btn danger" type="button" data-del-job>删除这个职位</button></div>
+      </div>
+    </aside>`;
+  const body = root.querySelector(".drawer-body"); body.scrollTop = scroll;
+  if(first){ const el = j.inst ? root.querySelector("[data-close-drawer].btn") : $("#j-inst"); el && el.focus(); }
+  else if(keepId){ const el = document.getElementById(keepId); el && el.focus(); }
+}
+
+/* ---------- Dialogs ---------- */
+const dlg = $("#dlg");
+function openDlg(html, wide){ dlg.className = wide ? "wide" : ""; dlg.innerHTML = `<div class="dlg">${html}</div>`; if(!dlg.open) dlg.showModal(); }
+function closeDlg(){ if(dlg.open) dlg.close(); dlg.innerHTML = ""; }
+dlg.addEventListener("click", e => { if(e.target === dlg) closeDlg(); });
+
+/* Event form */
+function eventDialog(id, presetJob, presetDate){
+  const e = id ? S.events.get(id) : {type:"interview", jobId:presetJob||"", date:presetDate || todayStr(), time:"", tz:LOCAL_TZ, format:"", place:"", notes:""};
+  openDlg(`
+    <div class="dlg-head"><h2>${id ? "编辑日程" : "添加日程"}</h2><button class="btn ghost" type="button" data-close-dlg>关闭</button></div>
+    <form class="dlg-body" id="ev-form">
+      <div class="f2">
+        <label class="field"><span>类型</span><select name="type">${EV_TYPES.map(t => `<option value="${t.k}"${e.type===t.k?" selected":""}>${esc(t.l)}</option>`).join("")}</select></label>
+        <label class="field"><span>职位</span><select name="jobId"><option value="">不关联职位</option>${jobOptions(e.jobId)}</select></label>
+      </div>
+      <label class="field"><span>标题（不关联职位时使用）</span><input type="text" name="title" value="${esc(e.title)}" placeholder="例如：中国经济学年会报到"></label>
+      <div class="f3">
+        <label class="field"><span>日期</span><input type="date" name="date" value="${esc(e.date)}" required></label>
+        <label class="field"><span>时间（留空表示全天）</span><input type="time" name="time" value="${esc(e.time)}"></label>
+        <label class="field"><span>这个时间所在的时区</span><select name="tz">${TZS.map(([k,l]) => `<option value="${k}"${(e.tz||LOCAL_TZ)===k?" selected":""}>${esc(l)}</option>`).join("")}</select></label>
+      </div>
+      <p class="hint" id="ev-conv" style="margin-top:-6px"></p>
+      <div class="f2">
+        <label class="field"><span>形式</span><select name="format">${FORMATS.map(f => `<option value="${esc(f)}"${(e.format||"")===f?" selected":""}>${f ? esc(f) : "未设置"}</option>`).join("")}</select></label>
+        <label class="field"><span>地点或会议链接</span><input type="text" name="place" value="${esc(e.place)}"></label>
+      </div>
+      <label class="field"><span>备注（面试官、报告时长、试讲课程和时长、准备要点）</span><textarea name="notes" rows="4">${esc(e.notes)}</textarea></label>
+    </form>
+    <div class="dlg-foot">${id ? `<button class="btn danger" type="button" data-del-event="${esc(id)}">删除</button>` : ""}
+      <div class="r"><button class="btn" type="button" data-close-dlg>取消</button><button class="btn primary" type="submit" form="ev-form">${id ? "保存" : "添加"}</button></div></div>`);
+  const form = $("#ev-form");
+  const conv = () => { const fd = new FormData(form); const d = fd.get("date"), t = fd.get("time"), tz = fd.get("tz");
+    $("#ev-conv").textContent = d && t && tz !== LOCAL_TZ ? `= ${TZL[LOCAL_TZ] || LOCAL_TZ}时间 ${(p => fmtDate(p.date) + " " + p.time)(partsIn(zonedToUtc(d,t,tz), LOCAL_TZ))}` : ""; };
+  form.addEventListener("input", conv); conv();
+  form.addEventListener("submit", ev => { ev.preventDefault(); const fd = Object.fromEntries(new FormData(form));
+    const eid = id || uid(); const prev = S.events.get(eid) || {createdAt:nowIso()};
+    S.events.set(eid, {...prev, ...fd, updatedAt:nowIso()}); save("events", eid);
+    if(fd.jobId){ const j = S.jobs.get(fd.jobId); const want = ["flyout","talk","demo"].includes(fd.type) ? "flyout" : fd.type === "interview" ? "interview" : null;
+      const order = STATUSES.map(s => s.k); if(j && want && order.indexOf(j.status||"watch") < order.indexOf(want)) { patch("jobs", fd.jobId, {status:want}); toast(`已添加，并把状态更新为“${ST[want].l}”`); } else toast(id ? "已保存" : "已添加"); }
+    else toast(id ? "已保存" : "已添加");
+    closeDlg(); refresh(); });
+}
+
+/* Material version form */
+function matDialog(id, presetJob){
+  const m = id ? S.mats.get(id) : {kind:"研究计划", label:"", date:todayStr(), link:"", jobIds:presetJob ? [presetJob] : [], notes:""};
+  const sel = new Set(m.jobIds||[]);
+  const jobs = [...S.jobs.entries()].filter(([jid,j]) => !CLOSED.has(j.status||"watch") || sel.has(jid)).sort((a,b) => jobName(a[1]).localeCompare(jobName(b[1])));
+  openDlg(`
+    <div class="dlg-head"><h2>${id ? "编辑材料版本" : "记录材料版本"}</h2><button class="btn ghost" type="button" data-close-dlg>关闭</button></div>
+    <form class="dlg-body" id="mat-form">
+      <div class="f2">
+        <label class="field"><span>材料类型</span><select name="kind">${MAT_KINDS.map(k => `<option${(m.kind||"其他")===k?" selected":""}>${esc(k)}</option>`).join("")}</select></label>
+        <label class="field"><span>日期</span><input type="date" name="date" value="${esc(m.date)}"></label>
+      </div>
+      <label class="field"><span>版本名称</span><input type="text" name="label" value="${esc(m.label)}" placeholder="例如：研究计划 · 数字经济方向 v2" required></label>
+      <label class="field"><span>文件链接（Overleaf、网盘等）</span><input type="url" name="link" value="${esc(m.link)}" placeholder="https://"></label>
+      <div class="field"><span>用于哪些职位</span>
+        <input type="search" id="mat-pick-q" placeholder="筛选学校" aria-label="筛选学校">
+        <div class="picklist" id="mat-pick">${jobs.length ? jobs.map(([jid,j]) => `<label data-name="${esc((jobName(j)+" "+(j.dept||"")).toLowerCase())}"><input type="checkbox" name="jobIds" value="${esc(jid)}"${sel.has(jid)?" checked":""}> ${esc(jobName(j))}${j.dept ? `<span class="status-line">${esc(j.dept)}</span>` : ""}</label>`).join("") : `<p class="hint" style="padding:6px">还没有职位。</p>`}</div>
+      </div>
+      <label class="field"><span>备注（这一版改了什么）</span><textarea name="notes" rows="3">${esc(m.notes)}</textarea></label>
+    </form>
+    <div class="dlg-foot">${id ? `<button class="btn danger" type="button" data-del-mat="${esc(id)}">删除</button>` : ""}
+      ${id && m.link ? `<a class="btn" href="${esc(m.link)}" target="_blank" rel="noopener">打开文件</a>` : ""}
+      <div class="r"><button class="btn" type="button" data-close-dlg>取消</button><button class="btn primary" type="submit" form="mat-form">${id ? "保存" : "添加"}</button></div></div>`);
+  $("#mat-pick-q").addEventListener("input", ev => { const q = ev.target.value.trim().toLowerCase(); document.querySelectorAll("#mat-pick label").forEach(l => l.hidden = q && !l.dataset.name.includes(q)); });
+  $("#mat-form").addEventListener("submit", ev => { ev.preventDefault(); const form = ev.target; const fd = new FormData(form);
+    const mid = id || uid(); const prev = S.mats.get(mid) || {createdAt:nowIso()};
+    S.mats.set(mid, {...prev, kind:fd.get("kind"), label:fd.get("label"), date:fd.get("date"), link:fd.get("link"), notes:fd.get("notes"), jobIds:fd.getAll("jobIds"), updatedAt:nowIso()});
+    save("materials", mid); toast(id ? "已保存" : "已添加"); closeDlg(); refresh(); });
+}
+
+/* ---------- JOE import ---------- */
+let IMP = null;
+function loadXlsx(){
+  if(window.XLSX) return Promise.resolve();
+  return loadXlsx.p ||= new Promise((res, rej) => { const s = document.createElement("script"); s.src = "https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"; s.onload = res; s.onerror = () => { loadXlsx.p = null; rej(new Error("load")); }; document.head.appendChild(s); });
+}
+function importDialog(){
+  IMP = null; SHEET = null;
+  openDlg(`
+    <div class="dlg-head"><h2>导入表格</h2><button class="btn ghost" type="button" data-close-dlg>关闭</button></div>
+    <div class="dlg-body" id="imp-body">
+      <p class="hint" style="margin:0">导入你自己整理的职位表（Excel / CSV），或者 AEA JOE 的导出文件（会自动识别）。同一个表格以后改了再导入，会更新对应的职位，不会重复添加。</p>
+      <div class="drop" id="imp-drop">把 .xlsx / .xls / .csv 文件拖到这里，或 <label for="imp-file">选择文件</label><input type="file" id="imp-file" accept=".xls,.xlsx,.csv" hidden></div>
+      <label class="field"><span>或者粘贴表格内容（在 Excel 里选中包括表头的区域，复制后粘贴）</span><textarea id="imp-paste" rows="5" placeholder="学校	截止日期	提交渠道	材料要求"></textarea></label>
+      <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:center">
+        <span class="hint" style="margin:0">JOE 导出：在 <a href="https://www.aeaweb.org/joe/listings" target="_blank" rel="noopener">JOE 职位列表</a> 点 Download Options → Native XLS；导入时默认只显示中国大陆和澳门。</span>
+        <button class="btn" type="button" id="imp-paste-go">读取粘贴内容</button>
+      </div>
+    </div>`, true);
+  const drop = $("#imp-drop"), file = $("#imp-file");
+  file.addEventListener("change", () => file.files[0] && readTableFile(file.files[0]));
+  drop.addEventListener("dragover", e => { e.preventDefault(); drop.classList.add("over"); });
+  drop.addEventListener("dragleave", () => drop.classList.remove("over"));
+  drop.addEventListener("drop", e => { e.preventDefault(); drop.classList.remove("over"); const f = e.dataTransfer.files[0]; f && readTableFile(f); });
+}
+async function readTableFile(f){
+  const body = $("#imp-body");
+  body.innerHTML = `<div class="empty">正在读取 ${esc(f.name)}…</div>`;
+  try { await loadXlsx(); } catch { body.innerHTML = `<div class="empty"><strong>表格解析组件没有加载成功。</strong>检查网络后关闭这个窗口再试一次。</div>`; return; }
+  let aoa;
+  try {
+    const wb = XLSX.read(await f.arrayBuffer(), {type:"array"});
+    aoa = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], {header:1, defval:"", raw:true});
+  } catch(e){ body.innerHTML = `<div class="empty"><strong>这个文件读不出来。</strong>请确认它是 XLSX、XLS 或 CSV 文件。</div>`; return; }
+  routeTable(aoa, f.name);
+}
+function readPasted(){
+  const t = $("#imp-paste").value.replace(/\r/g,"").trim();
+  if(!t){ toast("先粘贴表格内容"); return; }
+  routeTable(t.split("\n").map(l => l.split("\t")), "粘贴的表格");
+}
+function routeTable(aoa, name){
+  aoa = aoa.filter(r => r.some(c => String(c ?? "").trim() !== ""));
+  if(!aoa.length){ $("#imp-body").innerHTML = `<div class="empty"><strong>表格里没有内容。</strong></div>`; return; }
+  const hdrIdx = Math.max(0, aoa.slice(0,5).findIndex(r => r.filter(c => Object.values(HDR).some(rx => rx.test(String(c)))).length >= 2 || r.some(c => /^jp_/i.test(String(c)))));
+  const head = aoa[hdrIdx].map(c => String(c ?? "").trim());
+  if(head.some(c => /^jp_institution$/i.test(c))){
+    const rows = aoa.slice(hdrIdx+1).map(r => Object.fromEntries(head.map((h,i) => [h, r[i] ?? ""])));
+    readJoe(rows); return;
+  }
+  sheetStart(head, aoa.slice(hdrIdx+1), name);
+}
+function normDate(v){
+  if(v === null || v === undefined || v === "") return "";
+  if(typeof v === "number" && v > 20000 && v < 80000){ const d = new Date(Math.round((v - 25569) * 864e5)); return `${d.getUTCFullYear()}-${pad(d.getUTCMonth()+1)}-${pad(d.getUTCDate())}`; }
+  const s = String(v).trim();
+  let m = /^(\d{4})-(\d{1,2})-(\d{1,2})/.exec(s); if(m) return `${m[1]}-${pad(m[2])}-${pad(m[3])}`;
+  m = /^(\d{1,2})\/(\d{1,2})\/(\d{2,4})/.exec(s); if(m){ const y = m[3].length === 2 ? "20"+m[3] : m[3]; return `${y}-${pad(m[1])}-${pad(m[2])}`; }
+  const t = Date.parse(s); if(!isNaN(t)){ const d = new Date(t); return ymd(d); }
+  return "";
+}
+function readJoe(rows){
+  const body = $("#imp-body");
+  if(!rows.length){ body.innerHTML = `<div class="empty"><strong>文件里没有数据行。</strong></div>`; return; }
+  const keys = Object.keys(rows[0]);
+  const find = (...names) => keys.find(k => names.some(n => k.trim().toLowerCase() === n)) || keys.find(k => names.some(n => k.trim().toLowerCase().includes(n)));
+  const col = { id:find("jp_id"), title:find("jp_title","title"), inst:find("jp_institution","institution"), dept:find("jp_department","department"),
+    div:find("jp_division","division"), section:find("jp_section","section"), kw:find("jp_keywords","keywords"), full:find("jp_full_text","full_text","full text"),
+    loc:find("locations","location"), jel:find("jel_classifications","jel"), dl:find("application_deadline","deadline"), issue:find("joe_issue_id","issue") };
+  if(!col.inst || !col.title){ body.innerHTML = `<div class="empty"><strong>没找到职位列。</strong>JOE 导出文件应包含 jp_institution 和 jp_title 两列；这个文件的列是：${esc(keys.slice(0,12).join("、"))}。</div>`; return; }
+  const g = (r,k) => k ? String(r[k] ?? "").trim() : "";
+  const list = rows.map(r => {
+    const id = g(r,col.id).replace(/\.0$/,"");
+    return { joeId:id, inst:g(r,col.inst), dept:[g(r,col.dept), g(r,col.div)].filter(Boolean).filter((v,i,a) => a.indexOf(v) === i).join(" · "),
+      title:g(r,col.title), section:g(r,col.section).replace(/^\d+\.\s*/,""), kw:g(r,col.kw), full:g(r,col.full).slice(0,20000),
+      loc:g(r,col.loc), jel:g(r,col.jel), deadline:normDate(col.dl ? r[col.dl] : ""), joeIssue:g(r,col.issue) };
+  }).filter(x => x.inst || x.title);
+  const sections = [...new Set(list.map(x => x.section).filter(Boolean))].sort();
+  IMP = { list, sections, sel:new Set(), q:"", section:"", futureOnly:true, china:true, limit:300 };
+  renderImport();
+}
+function impKey(x){ return x.joeId ? "joe-" + x.joeId.replace(/[^A-Za-z0-9_\-.~:@+]/g,"") : null; }
+function impFiltered(){
+  const q = IMP.q.trim().toLowerCase(); const t = todayStr();
+  return IMP.list.map((x,i) => [i,x]).filter(([,x]) => (!IMP.section || x.section === IMP.section) && (!IMP.futureOnly || !x.deadline || x.deadline >= t) && (!IMP.china || isMainland(x))
+    && (!q || [x.inst,x.dept,x.title,x.kw,x.jel,x.loc,x.full].join(" ").toLowerCase().includes(q)));
+}
+function renderImport(){
+  const body = $("#imp-body"); if(!body || !IMP) return;
+  const f = impFiltered(); const shown = f.slice(0, IMP.limit);
+  const allSel = f.length && f.every(([i]) => IMP.sel.has(i));
+  body.innerHTML = `
+    <div class="toolbar" style="margin:0">
+      <input type="search" id="imp-q" placeholder="搜索学校、城市、关键词、JEL" value="${esc(IMP.q)}" aria-label="搜索">
+      <select id="imp-sec" aria-label="职位类别" style="max-width:320px"><option value="">所有类别</option>${IMP.sections.map(s => `<option${s===IMP.section?" selected":""}>${esc(s)}</option>`).join("")}</select>
+      <label class="chip" style="display:inline-flex;gap:6px;align-items:center"><input type="checkbox" id="imp-china"${IMP.china?" checked":""}> 只看中国大陆和澳门</label>
+      <label class="chip" style="display:inline-flex;gap:6px;align-items:center"><input type="checkbox" id="imp-future"${IMP.futureOnly?" checked":""}> 只看未截止</label>
+    </div>
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
+      <label style="display:inline-flex;gap:8px;align-items:center;cursor:pointer"><input type="checkbox" id="imp-all"${allSel?" checked":""}> 选中全部筛选结果（${f.length}）</label>
+      <span class="status-line">文件共 ${IMP.list.length} 个职位，已选 ${IMP.sel.size} 个</span>
+    </div>
+    <div class="imp-list">${shown.length ? shown.map(([i,x]) => `<label class="imp-row"><input type="checkbox" data-imp="${i}"${IMP.sel.has(i)?" checked":""}>
+        <div style="min-width:0"><div class="t1">${esc(x.inst)}${S.jobs.has(impKey(x)) ? '<span class="badge">已导入</span>' : ""}</div><div class="t2">${esc([x.dept, x.title].filter(Boolean).join(" · "))}</div>${x.jel ? `<div class="t2">JEL ${esc(x.jel)}</div>` : ""}</div>
+        <div class="d">${x.deadline ? "截止 " + esc(fmtDate(x.deadline,false)) : "无截止日期"}</div></label>`).join("")
+      : `<div class="empty">没有符合条件的职位。</div>`}
+      ${f.length > shown.length ? `<div style="padding:10px;text-align:center"><button class="btn" type="button" id="imp-more">再显示 ${Math.min(300, f.length - shown.length)} 个</button></div>` : ""}
+    </div>
+    <div id="imp-prog" hidden><div class="progress"><i></i></div><p class="hint" id="imp-prog-t"></p></div>
+    <div style="display:flex;justify-content:flex-end;gap:8px"><button class="btn" type="button" data-close-dlg>取消</button><button class="btn primary" type="button" id="imp-go"${IMP.sel.size?"":" disabled"}>导入所选 ${IMP.sel.size} 个职位</button></div>`;
+}
+async function runImport(){
+  const picks = [...IMP.sel].map(i => IMP.list[i]); if(!picks.length) return;
+  const go = $("#imp-go"); go.disabled = true; $("#imp-prog").hidden = false;
+  let n = 0, added = 0, updated = 0;
+  const step = () => { n++; $("#imp-prog i").style.width = Math.round(n/picks.length*100) + "%"; $("#imp-prog-t").textContent = `正在保存 ${n} / ${picks.length}`; };
+  const info = x => ({inst:x.inst, dept:x.dept, title:x.title, section:x.section, kw:x.kw, full:x.full, loc:x.loc, city:(x.loc||"").split(",")[0].trim(), jel:x.jel, deadline:x.deadline, joeId:x.joeId, joeIssue:x.joeIssue, source:"joe", srcType:"JOE"});
+  const tasks = picks.map(x => async () => {
+    const id = impKey(x) || "m-" + uid(); const cur = S.jobs.get(id);
+    if(cur){ S.jobs.set(id, {...cur, ...info(x), updatedAt:nowIso()}); updated++; }
+    else { S.jobs.set(id, {...info(x), status:"watch", prio:0, req:{...DEFAULT_REQ}, portal:"", url:"", notes:"", createdAt:nowIso(), updatedAt:nowIso()}); added++; }
+    await enqueue(`jobs/${id}`, () => S.db.doc(`jobs/${id}`).set(JSON.parse(JSON.stringify(S.jobs.get(id))))); step();
+  });
+  let k = 0; await Promise.all(Array.from({length:3}, async () => { while(k < tasks.length){ const t = tasks[k++]; await t(); } }));
+  closeDlg(); toast(`已导入：新增 ${added} 个，更新 ${updated} 个`); S.jobFilter.status = "active"; location.hash === "#jobs" ? render() : (location.hash = "jobs");
+}
+
+
+
+/* ---------- Import the user's own sheet (Excel / CSV / pasted cells) ---------- */
+let SHEET = null;
+const HDR = {
+  deadline:/截止|deadline|ddl|due/i, name:/学校|单位|机构|高校|school|institution|univ/i, dept:/学院|院系|部门|department|dept/i,
+  title:/岗位|职位|position|title|职级/i, channel:/渠道|提交|入口|方式|系统|portal|apply|link|链接/i, materials:/材料|要求|requirement|material/i,
+  status:/状态|进度|status/i, city:/城市|地点|city|location/i, notes:/备注|笔记|说明|note|remark|comment/i, prio:/优先|priority/i,
+};
+const SHEET_FIELDS = [["name","学校（必填）"],["dept","学院"],["title","岗位"],["deadline","截止日期"],["channel","提交渠道"],["materials","材料要求"],["status","状态"],["city","城市"],["notes","备注"],["prio","优先级"]];
+const SCHOOL_ALIAS = [["港中深","香港中文大学（深圳）"],["港科广","香港科技大学（广州）"],["北师港浸","北师香港浸会大学"],["上纽大","上海纽约大学"],["北大","北京大学"],["清华","清华大学"],["人大","中国人民大学"],
+  ["复旦","复旦大学"],["上交","上海交通大学"],["交大","上海交通大学"],["上财","上海财经大学"],["浙大","浙江大学"],["南大","南京大学"],["武大","武汉大学"],["厦大","厦门大学"],["中大","中山大学"],
+  ["华科","华中科技大学"],["西财","西南财经大学"],["西南财大","西南财经大学"],["央财","中央财经大学"],["贸大","对外经济贸易大学"],["中南财","中南财经政法大学"],["暨南","暨南大学"],["暨大","暨南大学"],
+  ["山大","山东大学"],["东财","东北财经大学"],["湖大","湖南大学"],["昆杜","昆山杜克大学"],["DKU","昆山杜克大学"],["西浦","西交利物浦大学"],["中欧","中欧国际工商学院"],["CEIBS","中欧国际工商学院"],
+  ["北航","北京航空航天大学"],["北理","北京理工大学"],["华理","华东理工大学"]];
+const DEPT_ALIAS = [["安泰","安泰"],["高金","高级金融"],["SAIF","高级金融"],["光华","光华"],["新结构","新结构"],["南南","南南"],["国发院","国家发展研究院"],["汇丰","汇丰"],["经院","经济学院"],
+  ["财金","财政金融"],["WISE","王亚南"],["邹至庄","邹至庄"],["ISER","经济与社会研究院"],["IESR","经济与社会研究院"],["五道口","五道口"],["滴水湖","滴水湖"],["DAFI","滴水湖"],["文澜","文澜"],
+  ["劳人","劳动人事"],["岭南","岭南"],["财政","财政"],["金融","金融"],["经济","经济"],["商学院","商学院"],["管理","管理"],["统计","统计"],["保险","保险"]];
+const STATUS_WORDS = [[/不申请|放弃|skip/i,"skip"],[/拒|reject/i,"rejected"],[/offer|录用|签约/i,"offer"],[/校园|fly|到校/i,"flyout"],[/面试|interview/i,"interview"],
+  [/已提交|已投|已申请|submitted|sent|done/i,"sent"],[/准备|prep|进行中/i,"prep"],[/待定|关注|观望|watch/i,"watch"]];
+const URL_RE = /https?:\/\/[^\s，,；;）)]+/i, EMAIL_RE = /[\w.+-]+@[\w-]+(?:\.[\w-]+)+/;
+const PLATFORM_HOSTS = /aeaweb\.org|interfolio\.com|econjobmarket\.org|academicjobsonline\.org|mp\.weixin\.qq\.com|cuhk\.edu\.cn/i;
+
+function cell(v){ return String(v ?? "").trim(); }
+function cycleDate(mo, d){ const t = new Date(); let y = t.getFullYear(); if((t - new Date(y, mo-1, d)) / 864e5 > 120) y++; return `${y}-${pad(mo)}-${pad(d)}`; }
+function parseSheetDate(v){
+  if(v === "" || v === null || v === undefined) return {date:""};
+  if(typeof v === "number"){
+    if(v > 20000 && v < 80000) return {date:normDate(v)};
+    const m = /^(\d{1,2})\.(\d{1,2})$/.exec(String(v));
+    if(m){ const mo = +m[1], d = +m[2]; if(mo >= 1 && mo <= 12 && d >= 1 && d <= 31)
+      return {date:cycleDate(mo,d), warn: m[2].length === 1 && d <= 3 ? `表格里是数字 ${v}，按 ${mo} 月 ${d} 日处理；如果是 ${mo} 月 ${d}0 日，请在右侧改正` : ""}; }
+    return {date:"", warn:`看不懂的日期：${v}`};
+  }
+  const s = cell(v);
+  let m = /^(\d{1,2})\s*[.\/月-]\s*(\d{1,2})\s*日?$/.exec(s);
+  if(m && +m[1] <= 12) return {date:cycleDate(+m[1], +m[2])};
+  m = /^(\d{4})\s*[.\/年-]\s*(\d{1,2})\s*[.\/月-]\s*(\d{1,2})/.exec(s);
+  if(m) return {date:`${m[1]}-${pad(m[2])}-${pad(m[3])}`};
+  const n = normDate(s); if(n) return {date:n};
+  return {date:"", warn:`看不懂的日期：${s}`};
+}
+function classifyChannel(v){
+  const s = cell(v); if(!s) return {};
+  const u = (s.match(URL_RE) || [])[0], e = (s.match(EMAIL_RE) || [])[0];
+  const o = {raw:s};
+  if(u){ o.applyUrl = u; o.portal = /interfolio/i.test(u) ? "Interfolio" : /aeaweb\.org\/joe/i.test(u) ? "AEA JOE" : /econjobmarket/i.test(u) ? "EconJobMarket" : /academicjobsonline/i.test(u) ? "AcademicJobsOnline" : "学校招聘系统"; }
+  else if(e){ o.email = e; o.portal = "邮件投递"; }
+  else if(/EJM|econjobmarket/i.test(s)) o.portal = "EconJobMarket";
+  else if(/AEA|JOE/i.test(s)) o.portal = "AEA JOE";
+  else if(/interfolio/i.test(s)) o.portal = "Interfolio";
+  if(!u && !e) o.text = s;
+  return o;
+}
+function rowSigs(texts){
+  const sigs = new Set(); const all = texts.join(" ");
+  for(const m of all.matchAll(/JOE_ID=(?:\d{4}-\d{2}_)?(\d{6,})/gi)) sigs.add(m[1]);
+  for(const m of all.matchAll(/interfolio\.com\/(\d+)/gi)) sigs.add("interfolio.com/" + m[1]);
+  for(const m of all.matchAll(/econjobmarket\.org\/positions\/(\d+)/gi)) sigs.add("positions/" + m[1]);
+  for(const m of all.matchAll(/jobDetails\?id=(\d+)/gi)) sigs.add("jobdetails?id=" + m[1]);
+  for(const m of all.matchAll(/academicjobsonline\.org\/ajo\/jobs\/(\d+)/gi)) sigs.add("ajo/jobs/" + m[1]);
+  for(const m of all.matchAll(new RegExp(EMAIL_RE.source, "g"))) sigs.add(m[0].toLowerCase());
+  for(const m of all.matchAll(/https?:\/\/([^\/\s?#]+)/gi)){ const h = m[1].toLowerCase(); if(!PLATFORM_HOSTS.test(h)) sigs.add(h); }
+  return [...sigs].map(x => x.toLowerCase());
+}
+function jobHay(j){ return [j.url, j.applyUrl, j.notes, j.full, j.contact, j.sheetNote].join(" ").toLowerCase(); }
+function nameHints(name){
+  let rest = name.trim(), school = "";
+  for(const [a, full] of SCHOOL_ALIAS) if(rest.toUpperCase().startsWith(a.toUpperCase())){ school = full; rest = rest.slice(a.length); break; }
+  const hints = [];
+  for(const [a, h] of DEPT_ALIAS) if(rest.toUpperCase().includes(a.toUpperCase())){ hints.push(h); rest = rest.replace(new RegExp(a, "i"), " "); }
+  return {school, hints};
+}
+function scoreJob(j, hints){
+  const d = (j.dept || "") + " " + (j.title || "") + " " + (j.inst || "");
+  let sc = 0;
+  for(const h of hints){ if(d.includes(h)) sc += 2; if((j.dept || "").startsWith(h)) sc += 1; }
+  if(!hints.includes("金融") && !hints.includes("高级金融") && /金融/.test(j.dept || "")) sc -= 0.5;
+  if(!hints.length && /经济学院|经济系/.test(j.dept || "")) sc += 1;
+  return sc;
+}
+function matchSheetRow(r){
+  for(const [id, j] of S.jobs) if(j.sheetKey && j.sheetKey === r.key) return {id, how:"上次导入的同一行", sure:true};
+  const {school, hints} = nameHints(r.name);
+  const pool = [...S.jobs.entries()].filter(([, j]) => !CLOSED.has(j.status || "watch") || j.sheetKey);
+  const best = cands => { if(!cands.length) return null; if(cands.length === 1) return {id:cands[0][0], tie:false};
+    const sc = cands.map(([id, j]) => [id, scoreJob(j, hints)]).sort((a, b) => b[1] - a[1]); return {id:sc[0][0], tie:sc[0][1] === sc[1][1]}; };
+  const sigs = rowSigs([r.channelRaw, r.materialsRaw, r.notesRaw]);
+  if(sigs.length){
+    const c = pool.filter(([, j]) => { const h = jobHay(j); return sigs.some(sg => h.includes(sg)); });
+    const direct = c.filter(([, j]) => { const h = [j.url, j.applyUrl, j.contact].join(" ").toLowerCase(); return sigs.some(sg => h.includes(sg)); });
+    const b = best(direct.length ? direct : c); if(b) return {id:b.id, how:"链接或邮箱一致", sure:!b.tie};
+  }
+  const inst = school || r.name;
+  const c = pool.filter(([, j]) => j.inst && (j.inst.includes(inst) || (school === "" && r.name.includes(j.inst))));
+  const b = best(c);
+  if(b) return {id:b.id, how: school ? `“${r.name}”识别为${school}` : "学校名称一致", sure:!b.tie && (c.length === 1 || hints.length > 0)};
+  return null;
+}
+function sheetStart(head, rows, srcName){
+  const map = {}; const used = new Set();
+  for(const [f] of SHEET_FIELDS){ const i = head.findIndex((h, k) => !used.has(k) && HDR[f].test(h)); if(i >= 0){ map[f] = i; used.add(i); } }
+  if(map.name === undefined) map.name = 0;
+  SHEET = {head, rows, srcName, map, parsed:null};
+  sheetParse(); renderSheet();
+}
+function sheetParse(){
+  const {rows, map} = SHEET; const get = (r, f) => map[f] === undefined ? "" : r[map[f]];
+  const seen = {}, seenSig = {};
+  SHEET.parsed = rows.map((r, i) => {
+    const name = cell(get(r, "name")); if(!name) return null;
+    const dept = cell(get(r, "dept")), title = cell(get(r, "title"));
+    const key = [name, dept, title].join("|").replace(/\s+/g, "").toLowerCase();
+    const dl = parseSheetDate(get(r, "deadline"));
+    const ch = classifyChannel(get(r, "channel"));
+    const mat = cell(get(r, "materials")), notes = cell(get(r, "notes"));
+    const st = cell(get(r, "status")); const status = st ? (STATUS_WORDS.find(([rx]) => rx.test(st)) || [])[1] || "" : "";
+    const pr = cell(get(r, "prio")); const prio = pr ? Math.max(0, Math.min(3, (pr.match(/★/g) || []).length || parseInt(pr, 10) || (/高/.test(pr) ? 3 : /中/.test(pr) ? 2 : /低/.test(pr) ? 1 : 0))) : null;
+    const row = {i, name, dept, title, key, deadline:dl.date, warn:dl.warn || "", ch, materialsRaw:mat, notesRaw:notes, channelRaw:cell(get(r, "channel")), city:cell(get(r, "city")), status, prio, keep:true};
+    if(seen[key] !== undefined){ row.warn = (row.warn ? row.warn + "；" : "") + `和第 ${seen[key] + 1} 行重复，以这一行为准`; }
+    seen[key] = i;
+    for(const sg of rowSigs([row.channelRaw, row.materialsRaw]).filter(x => !x.includes("@"))){
+      if(seenSig[sg] !== undefined && seenSig[sg] !== i && rows[seenSig[sg]] && cell(rows[seenSig[sg]][map.name]) !== name){ row.warn = (row.warn ? row.warn + "；" : "") + `和第 ${seenSig[sg] + 1} 行（${cell(rows[seenSig[sg]][map.name])}）链接相同，可能是同一个职位`; break; }
+      seenSig[sg] = i;
+    }
+    const m = matchSheetRow(row); row.target = m ? m.id : "new"; row.how = m ? m.how : ""; row.sure = m ? m.sure : true;
+    return row;
+  }).filter(Boolean);
+}
+function sheetChanges(r){
+  const j = r.target === "new" ? null : S.jobs.get(r.target); const out = [];
+  if(r.deadline && (!j || j.deadline !== r.deadline)) out.push(`截止 → ${fmtDate(r.deadline, false)}`);
+  if(r.ch.applyUrl && (!j || j.applyUrl !== r.ch.applyUrl)) out.push("申请入口");
+  if(r.ch.email && (!j || !(j.contact || "").includes(r.ch.email))) out.push(`邮箱 ${r.ch.email}`);
+  if(r.ch.portal && (!j || j.portal !== r.ch.portal)) out.push(`方式 ${r.ch.portal}`);
+  if(r.materialsRaw) out.push("材料要求");
+  const ns = r.status || (j ? (EARLY.has(j.status || "watch") ? "prep" : "") : "prep");
+  if(ns && (!j || (j.status || "watch") !== ns)) out.push(`状态 → ${ST[ns].l}`);
+  return out.length ? out.join("；") : "没有变化";
+}
+function renderSheet(){
+  const body = $("#imp-body"); if(!body || !SHEET) return;
+  const {head, map, parsed} = SHEET;
+  const opts = sel => `<option value="">（不导入）</option>` + head.map((h, i) => `<option value="${i}"${sel === i ? " selected" : ""}>${esc(h || `第 ${i+1} 列`)}</option>`).join("");
+  const jobsSorted = [...S.jobs.entries()].sort((a, b) => jobName(a[1]).localeCompare(jobName(b[1])));
+  const jobOpts = sel => `<option value="new"${sel === "new" ? " selected" : ""}>新建职位</option>` + jobsSorted.map(([id, j]) => `<option value="${esc(id)}"${sel === id ? " selected" : ""}>${esc(jobName(j))}${j.dept ? " · " + esc(j.dept) : ""}</option>`).join("");
+  const n = parsed.filter(r => r.keep).length, nNew = parsed.filter(r => r.keep && r.target === "new").length, nCheck = parsed.filter(r => r.keep && (!r.sure || r.warn)).length;
+  body.innerHTML = `
+    <details${map.name === undefined ? " open" : ""}><summary class="sec-title" style="display:inline">列对应关系（${esc(SHEET.srcName)}）</summary>
+      <div class="f3" style="margin-top:10px">${SHEET_FIELDS.map(([f, l]) => `<label class="field"><span>${esc(l)}</span><select data-map="${f}">${opts(map[f])}</select></label>`).join("")}</div></details>
+    <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:center">
+      <span class="status-line">共 ${parsed.length} 行：更新已有职位 ${n - nNew} 个，新建 ${nNew} 个${nCheck ? `，<b style="color:var(--soon)">${nCheck} 行需要确认</b>` : ""}</span>
+      <span class="hint" style="margin:0">表格里填了的内容会覆盖工作台里的同一字段；空格子不改动。</span>
+    </div>
+    <div class="imp-list" style="max-height:52vh">${parsed.map((r, k) => `
+      <div class="sheet-row${(!r.sure || r.warn) ? " check" : ""}" data-sr="${k}">
+        <input type="checkbox" data-sr-keep${r.keep ? " checked" : ""} aria-label="导入 ${esc(r.name)}">
+        <div style="min-width:0">
+          <div class="t1">${esc(r.name)}${r.dept ? " · " + esc(r.dept) : ""}${r.title ? " · " + esc(r.title) : ""}</div>
+          <div class="t2">${esc(sheetChanges(r))}</div>
+          ${r.how ? `<div class="t2">匹配依据：${esc(r.how)}${r.sure ? "" : "（有多个可能，请确认）"}</div>` : ""}
+          ${r.warn ? `<div class="t2" style="color:var(--soon)">${esc(r.warn)}</div>` : ""}
+        </div>
+        <input type="date" data-sr-date value="${esc(r.deadline)}" aria-label="截止日期">
+        <select data-sr-target aria-label="对应的职位">${jobOpts(r.target)}</select>
+      </div>`).join("")}</div>
+    <div style="display:flex;justify-content:flex-end;gap:8px"><button class="btn" type="button" data-close-dlg>取消</button><button class="btn primary" type="button" id="sheet-go"${n ? "" : " disabled"}>导入 ${n} 行</button></div>`;
+}
+function linesUniq(arr){ return [...new Set(arr.filter(Boolean))].join("\n"); }
+async function applySheet(){
+  const go = $("#sheet-go"); go.disabled = true; go.textContent = "正在保存…";
+  let up = 0, add = 0;
+  for(const r of SHEET.parsed){
+    if(!r.keep) continue;
+    const isNew = r.target === "new" || !S.jobs.get(r.target);
+    const id = isNew ? "x-" + uid() : r.target;
+    const j = isNew ? null : S.jobs.get(id);
+    const {school, hints} = nameHints(r.name);
+    const p = {sheetKey:r.key, alias:r.name};
+    if(r.deadline) p.deadline = r.deadline;
+    if(r.ch.applyUrl) p.applyUrl = r.ch.applyUrl;
+    if(r.ch.portal) p.portal = PORTALS.includes(r.ch.portal) ? r.ch.portal : "其他";
+    if(r.ch.email && !(j && (j.contact || "").includes(r.ch.email))) p.contact = j && j.contact ? j.contact + "；" + r.ch.email : r.ch.email;
+    if(r.city) p.city = r.city;
+    if(r.prio !== null) p.prio = r.prio;
+    const matLine = r.materialsRaw ? "材料要求：" + r.materialsRaw : "";
+    p.sheetNote = linesUniq([r.ch.text ? "提交渠道：" + r.ch.text : "", matLine, r.notesRaw ? "备注：" + r.notesRaw : ""]);
+    const req = {}; if(r.materialsRaw && !URL_RE.test(r.materialsRaw)) for(const [k, rx] of [["cv",/cv|curriculum|简历/i],["research",/research statement|研究陈述|研究计划/i],["teaching",/teaching|教学/i],["letters",/recommendation|reference|推荐信/i],["cover",/cover letter|求职信/i],["jmp",/writing sample|job market paper|jmp|代表作|论文/i]]) if(rx.test(r.materialsRaw)) req[k] = 1;
+    if(isNew){
+      const doc = {inst:school || r.name, dept:r.dept || (school && hints.length ? "" : ""), title:r.title, status:r.status || "prep", prio:p.prio ?? 0,
+        req:Object.keys(req).length ? req : {...DEFAULT_REQ}, notes:"", url:"", srcType:"", source:"sheet", createdAt:nowIso(), updatedAt:nowIso(), ...p};
+      if(doc.prio === null) doc.prio = 0;
+      S.jobs.set(id, doc); add++;
+    } else {
+      const ns = r.status || (EARLY.has(j.status || "watch") ? "prep" : "");
+      if(ns) p.status = ns;
+      if(Object.keys(req).length){ const rq = {...(j.req || {})}; for(const k in req) if(!rq[k]) rq[k] = 1; p.req = rq; }
+      if(r.dept && !j.dept) p.dept = r.dept;
+      if(r.title && !j.title) p.title = r.title;
+      S.jobs.set(id, {...j, ...p, updatedAt:nowIso()}); up++;
+    }
+    await enqueue(`jobs/${id}`, () => S.db.doc(`jobs/${id}`).set(JSON.parse(JSON.stringify(S.jobs.get(id)))));
+  }
+  closeDlg(); SHEET = null; toast(`已导入：更新 ${up} 个，新建 ${add} 个`); refresh();
+}
+
+/* ---------- Recognize a posting (WeChat article, official page, EJM ad, screenshots) ---------- */
+let PARSE = null;
+const PARSE_ERR = {
+  not_granted:"没有设置 DeepSeek 密钥。", bad_key:"DeepSeek 密钥无效，到“设置 → 连接”里检查。", no_balance:"DeepSeek 账户余额不足。",
+  network:"连不上 DeepSeek。如果一直这样，可能是浏览器跨域限制，需要在连接设置里填转发地址。", bad_request:"DeepSeek 拒绝了这次请求，可能是图片格式或内容太长。",
+  sampling_disabled:"当前不能调用 AI。", rate_limited:"调用太频繁，过一会儿再试。",
+  session_expired:"登录已过期。", image_rejected:"有图片无法识别：换成 JPG 或 PNG，或减少图片数量。",
+  prompt_too_large:"原文太长了，只保留招聘相关的部分再试。", invalid_json:"AI 的回答没能整理成职位信息，再试一次。",
+  refused:"AI 没有处理这段内容。", empty_completion:"没有识别出内容，检查一下粘贴的是不是招聘原文。",
+  images_unavailable:"这个视图不能发送图片，请改为粘贴文字。"
+};
+function parseDialog(){
+  if(!S.sample){ toast("识别功能需要先在“设置 → 连接”里填写 DeepSeek API 密钥。"); return; }
+  PARSE = {images:[], results:null, ctl:null, busy:false};
+  const canImg = !!(S.sampleLimits && S.sampleLimits.images);
+  openDlg(`
+    <div class="dlg-head"><h2>识别招聘信息</h2><button class="btn ghost" type="button" data-close-dlg>关闭</button></div>
+    <div class="dlg-body" id="parse-body">
+      <p class="hint" style="margin:0">粘贴公众号文章、学院官网或 EJM 招聘页的正文${canImg ? "，也可以添加截图或招聘海报（可以直接粘贴图片）" : ""}。AI 整理出学校、岗位、截止日期和材料要求，你确认后再保存。</p>
+      <label class="field"><span>招聘原文</span><textarea id="parse-text" rows="9" placeholder="公众号文章：在微信里打开，长按正文全选复制，或用“…”→“复制链接”在浏览器打开后复制"></textarea></label>
+      ${canImg ? `<div class="field"><span>截图或海报（最多 ${S.sampleLimits.images.maxCount} 张）</span>
+        <div class="drop" id="parse-drop" style="padding:14px">拖入图片、直接粘贴，或 <label for="parse-file">选择图片</label><input type="file" id="parse-file" accept="${esc(S.sampleLimits.images.mediaTypes.join(","))}" multiple hidden>
+        <div class="thumbs" id="parse-thumbs" style="margin-top:10px;justify-content:center"></div></div></div>` : ""}
+      <div class="f2">
+        <label class="field"><span>信息来源</span><select id="parse-src">${SOURCES.filter(Boolean).map(x => `<option${x==="微信公众号"?" selected":""}>${esc(x)}</option>`).join("")}</select></label>
+        <label class="field"><span>原文链接（可选）</span><input type="url" id="parse-url" placeholder="https://mp.weixin.qq.com/…"></label>
+      </div>
+      <div id="parse-out"></div>
+    </div>
+    <div class="dlg-foot"><span class="status-line" id="parse-status" aria-live="polite"></span>
+      <div class="r"><button class="btn" type="button" data-close-dlg>取消</button><button class="btn primary" type="button" id="parse-go">识别</button></div></div>`, true);
+  if(canImg){
+    $("#parse-file").addEventListener("change", e => addParseImages(e.target.files));
+    const drop = $("#parse-drop");
+    drop.addEventListener("dragover", e => { e.preventDefault(); drop.classList.add("over"); });
+    drop.addEventListener("dragleave", () => drop.classList.remove("over"));
+    drop.addEventListener("drop", e => { e.preventDefault(); drop.classList.remove("over"); addParseImages(e.dataTransfer.files); });
+  }
+}
+function addParseImages(files){
+  if(!PARSE || !S.sampleLimits || !S.sampleLimits.images) return;
+  for(const f of files){ if(!f.type.startsWith("image/")) continue; if(PARSE.images.length >= S.sampleLimits.images.maxCount){ toast(`最多 ${S.sampleLimits.images.maxCount} 张图片`); break; } PARSE.images.push(f); }
+  drawThumbs();
+}
+dlg.addEventListener("paste", e => { if(!PARSE || !$("#parse-drop")) return; const fs = [...(e.clipboardData?.files || [])].filter(f => f.type.startsWith("image/")); if(fs.length){ e.preventDefault(); addParseImages(fs); } });
+function drawThumbs(){
+  const box = $("#parse-thumbs"); if(!box) return;
+  box.querySelectorAll("img").forEach(i => URL.revokeObjectURL(i.src));
+  box.innerHTML = PARSE.images.map((f,i) => `<figure><img src="${URL.createObjectURL(f)}" alt="图片 ${i+1}"><button type="button" data-rm-img="${i}" aria-label="移除图片 ${i+1}">移除</button></figure>`).join("");
+}
+function parsePrompt(text, hasImg){
+  return `今天是 ${todayStr()}。下面是一则中国高校或研究机构的教师招聘信息${hasImg ? "（全部或部分内容在附带的图片里）" : ""}，可能来自微信公众号、学院官网或招聘网站。请提取其中适合经济学、金融学博士申请的教职岗位。
+
+规则：
+- 一则启事通常对应一个学院；同一启事里有明显不同的学院时分开列出。同一学院的多个职级合并为一条，jobType 写“多个职级”。
+- 只依据原文，不要推测；原文没有的字段填空字符串。
+- deadline 用 YYYY-MM-DD；原文只有月日时，按今天推断年份。“长期有效”“招满为止”“分批面试”之类写进 deadlineNote，deadline 留空。
+- materials 是数组，只从下列键中选原文明确要求的：cv（英文简历/CV）、cvzh（中文简历/个人简历）、jmp（代表作/论文）、research（研究计划/研究陈述）、teaching（教学陈述/教学计划）、letters（推荐信）、cover（求职信/申请信）、degree（学位证书/学历证明/成绩单）、form（申请表/登记表）、idcard（身份证/护照）、awards（获奖/项目证明）。
+- jobType 取值：助理教授（预聘/长聘轨）、讲师、副研究员/研究员、师资博士后、博士后、副教授及以上、多个职级、其他。
+- portal 取值：邮件投递、学校招聘系统、学院官网报名、EconJobMarket、AEA JOE、其他。
+- isMainland：机构是否在中国大陆或澳门（香港、台湾和其他地区填 false）。
+
+只输出一个 JSON 数组，例如：
+[{"inst":"某某大学","dept":"经济学院","title":"预聘制助理教授","jobType":"助理教授（预聘/长聘轨）","city":"上海","deadline":"2026-12-31","deadlineNote":"","fields":"产业组织、劳动经济学","materials":["cv","jmp","letters"],"contact":"hr@example.edu.cn","talentPlan":"可依托申报海外优青","pay":"","assess":"预聘期6年","portal":"邮件投递","summary":"一句话中文概括","isMainland":true}]
+没有找到任何教职岗位时输出 []。
+
+招聘原文：
+"""
+${text ? text.slice(0, 60000) : "（见图片）"}
+"""`;
+}
+async function runParse(){
+  const go = $("#parse-go"), st = $("#parse-status");
+  if(PARSE.busy){ PARSE.ctl && PARSE.ctl.abort(); return; }
+  const text = $("#parse-text").value.trim();
+  if(!text && !PARSE.images.length){ st.textContent = "先粘贴招聘原文或添加图片。"; return; }
+  PARSE.busy = true; PARSE.ctl = new AbortController(); go.textContent = "停止"; go.classList.remove("primary");
+  st.textContent = "AI 正在识别，通常需要 10–60 秒…"; $("#parse-out").innerHTML = "";
+  try {
+    const opts = {signal:PARSE.ctl.signal}; if(PARSE.images.length) opts.images = PARSE.images;
+    const out = await S.sample.json(parsePrompt(text, PARSE.images.length > 0), opts);
+    const arr = (Array.isArray(out) ? out : (out && Array.isArray(out.positions) ? out.positions : [])).filter(x => x && typeof x === "object");
+    PARSE.results = arr.map(x => ({...x, _keep: x.isMainland !== false}));
+    PARSE.text = text;
+    st.textContent = arr.length ? `识别出 ${arr.length} 个岗位，检查后保存。` : "没有在这段内容里找到教职岗位。";
+    renderParseResults();
+  } catch(e){
+    st.textContent = e && e.code === "cancelled" ? "已停止。" : (PARSE_ERR[e && e.code] || "识别失败，稍后再试。");
+  } finally {
+    PARSE.busy = false; go.classList.add("primary"); go.textContent = PARSE.results && PARSE.results.length ? "重新识别" : "识别";
+  }
+}
+function dupOf(x){
+  const n = s => String(s||"").replace(/\s|（.*?）|\(.*?\)/g,"").toLowerCase();
+  for(const [id,j] of S.jobs){ if(n(j.inst) && n(j.inst) === n(x.inst) && (!n(x.dept) || !n(j.dept) || n(j.dept) === n(x.dept))) return id; }
+  return null;
+}
+function renderParseResults(){
+  const out = $("#parse-out"); if(!out || !PARSE.results) return;
+  if(!PARSE.results.length){ out.innerHTML = ""; return; }
+  const matL = Object.fromEntries(MATS.map(m => [m.k, m.l]));
+  out.innerHTML = `<div style="display:flex;flex-direction:column;gap:10px">${PARSE.results.map((x,i) => { const dup = dupOf(x); return `
+    <div class="pcard" data-pi="${i}">
+      <div class="pcard-head"><input type="checkbox" id="pk-${i}" data-pkeep${x._keep?" checked":""}><label for="pk-${i}">保存这一条</label>
+        ${x.isMainland === false ? '<span class="badge" style="background:var(--urgent-soft);color:var(--urgent)">不在大陆或澳门</span>' : ""}
+        ${dup ? '<span class="badge" style="background:var(--soon-soft);color:var(--soon)">可能已存在</span>' : ""}</div>
+      <div class="f3">
+        <label class="field"><span>学校</span><input type="text" data-pf="inst" value="${esc(x.inst)}"></label>
+        <label class="field"><span>学院 / 系</span><input type="text" data-pf="dept" value="${esc(x.dept)}"></label>
+        <label class="field"><span>岗位</span><input type="text" data-pf="title" value="${esc(x.title)}"></label>
+        <label class="field"><span>岗位类型</span><select data-pf="jobType">${JOB_TYPES.map(t => `<option value="${esc(t)}"${(x.jobType||"")===t?" selected":""}>${t ? esc(t) : "未设置"}</option>`).join("")}</select></label>
+        <label class="field"><span>城市</span><input type="text" data-pf="city" value="${esc(x.city)}"></label>
+        <label class="field"><span>截止日期</span><input type="date" data-pf="deadline" value="${esc(/^\d{4}-\d{2}-\d{2}$/.test(x.deadline||"") ? x.deadline : "")}"></label>
+      </div>
+      <div class="metaline">${x.deadlineNote ? `<span>${esc(x.deadlineNote)}</span>` : ""}${x.fields ? `<span>方向：${esc(x.fields)}</span>` : ""}${x.contact ? `<span>${esc(x.contact)}</span>` : ""}${x.talentPlan ? `<span>${esc(x.talentPlan)}</span>` : ""}</div>
+      ${Array.isArray(x.materials) && x.materials.length ? `<div class="metaline"><span>材料：${esc(x.materials.filter(k => matL[k]).map(k => matL[k]).join("、"))}</span></div>` : ""}
+      ${x.summary ? `<p class="hint" style="margin:0">${esc(x.summary)}</p>` : ""}
+    </div>`; }).join("")}
+    <div style="display:flex;justify-content:flex-end"><button class="btn primary" type="button" id="parse-save">保存所选职位</button></div></div>`;
+}
+function saveParsed(){
+  const url = $("#parse-url").value.trim(), src = $("#parse-src").value;
+  let n = 0;
+  PARSE.results.forEach((x,i) => {
+    if(!x._keep) return;
+    const req = {}; (Array.isArray(x.materials) ? x.materials : []).forEach(k => { if(MAT_KEYS.includes(k)) req[k] = 1; });
+    const id = "p-" + uid();
+    S.jobs.set(id, { inst:x.inst||"", dept:x.dept||"", title:x.title||"", jobType:JOB_TYPES.includes(x.jobType) ? x.jobType : "", city:x.city||"",
+      deadline:/^\d{4}-\d{2}-\d{2}$/.test(x.deadline||"") ? x.deadline : "", deadlineNote:x.deadlineNote||"", kw:x.fields||"", contact:x.contact||"",
+      talentPlan:x.talentPlan||"", pay:x.pay||"", assess:x.assess||"", portal:PORTALS.includes(x.portal) ? x.portal : "", url, srcType:src,
+      full:(PARSE.text || "").slice(0,20000), status:"watch", prio:0, req:Object.keys(req).length ? req : {...DEFAULT_REQ}, notes:"",
+      source:"parsed", createdAt:nowIso(), updatedAt:nowIso() });
+    save("jobs", id); n++;
+  });
+  closeDlg(); PARSE = null; toast(n ? `已保存 ${n} 个职位` : "没有选中要保存的职位"); refresh();
+}
+
+
+/* ---------- Claude assistant (in-page chat with tools over the desk's data) ---------- */
+const AI = {open:false, msgs:[], busy:false, ctl:null, undo:[], turnUndo:0};
+const AI_SUGGEST = ["下周要交哪些申请？材料齐了吗？","哪些待筛选的职位最值得申请？挑 5 个说理由","帮我按截止日期排一个这两周的投递计划","模拟面试：问我一个学术报告类问题"];
+function aiJobLine(id, j){ const [d,k] = matProgress(j); return `${id} | ${jobName(j)} ${j.dept || ""} | ${(ST[j.status||"watch"]||ST.watch).l} | 截止 ${j.deadline || (j.deadlineNote ? "长期/滚动" : "未定")} | 材料 ${d}/${k} | 优先级 ${j.prio||0}${(j.tags||[]).length ? " | 标签 " + j.tags.join("、") : ""}${j.city ? " | " + j.city : ""}`; }
+function aiContext(){
+  const act = [...S.jobs.entries()].filter(([,j]) => !CLOSED.has(j.status || "watch")).sort(byDeadline);
+  const closed = S.jobs.size - act.length;
+  const now = Date.now();
+  const evs = [...S.events.entries()].map(([id,e]) => [id,e,evLocal(e)]).filter(([,,l]) => l.ms >= now - 864e5 && l.ms <= now + 60*864e5).sort((a,b) => a[2].ms - b[2].ms)
+    .map(([id,e,l]) => `${id} | ${l.date} ${l.time || "全天"} | ${(EVT[e.type]||EVT.other).l} | ${e.jobId && S.jobs.get(e.jobId) ? jobName(S.jobs.get(e.jobId)) : (e.title || "")}`);
+  const qa = {}; for(const x of S.qa.values()){ const c = x.cat || "通用"; qa[c] ||= [0,0,0]; qa[c][x.level||0]++; }
+  return `进行中的职位（${act.length} 个；另有 ${closed} 个已拒或不申请）：\nid | 学校 学院 | 状态 | 截止 | 材料完成/需要 | 优先级 | 标签 | 城市\n${act.map(([id,j]) => aiJobLine(id,j)).join("\n")}\n\n未来 60 天日程：\n${evs.join("\n") || "（无）"}\n\n面试题库（未准备/有草稿/熟练）：${Object.entries(qa).map(([c,v]) => `${c} ${v.join("/")}`).join("；") || "（空）"}\n\n可用状态：${STATUSES.map(x => x.k + "=" + x.l).join("，")}；标签：${TAGS.join("、") || "（无）"}；题库分类：${QA_CATS.join("、")}`;
+}
+function aiRules(){
+  return `你是李金璞的求职助手，嵌在他的私人求职工作台里。他是经济学博士，2026–27 求职季只申请中国大陆和澳门的经济学、金融教职。现在是北京时间 ${fmtDate(todayStr())}。
+
+规则：
+- 用中文回答，先给结论，简洁。列表最多 8 项。
+- 依据下面的数据和工具结果回答；需要某个职位的细节（招聘原文、材料要求、笔记）时用 get_job 查，不要编造职位信息。
+- 只有在他明确要求时才修改数据（改状态、优先级、截止日期、标签，追加笔记，加日程，加题目，保存回答要点）。改完说清楚改了什么。你不能删除任何数据。
+- 写求职信、研究计划等段落时，用他笔记和招聘原文里的信息，缺少的信息用【】标出让他补。
+- 模拟面试时一次只问一个问题，等他回答后再点评、追问；他要求时可用 save_answer 把整理后的要点存进题库。
+
+工作台数据：
+${aiContext()}`;
+}
+function aiTools(){
+  const jobOut = (id, j) => { const [d,k] = matProgress(j); return {id, 学校:jobName(j), 学院:j.dept||"", 岗位:j.title||"", 状态:(ST[j.status||"watch"]||ST.watch).l, 截止:j.deadline||"", 截止说明:j.deadlineNote||"", 城市:j.city||"", 材料:`${d}/${k}`}; };
+  const recordUndo = (coll, id) => { const cur = S[collKey(coll)].get(id); AI.undo.push({coll, id, prev: cur ? JSON.parse(JSON.stringify(cur)) : null}); AI.turnUndo++; };
+  const note = t => aiNote(t);
+  return [
+    {name:"get_job", description:"读取一个职位的完整信息：招聘原文摘要、材料清单及完成情况、笔记、待遇、考核、联系方式、链接。参数 id 来自数据列表第一列。", inputSchema:{type:"object", properties:{id:{type:"string"}}, required:["id"]},
+      execute:({id}) => { const j = S.jobs.get(String(id)); if(!j) throw new Error("没有这个 id"); note(`查看了 ${jobName(j)}`);
+        const req = Object.fromEntries(MATS.filter(m => (j.req||{})[m.k]).map(m => [m.l, j.req[m.k] === 2 ? "已完成" : "未完成"]));
+        return {...jobOut(id, j), 优先级:j.prio||0, 标签:j.tags||[], 岗位类型:j.jobType||"", 申请方式:j.portal||"", 招聘页:j.url||"", 申请入口:j.applyUrl||"", 联系方式:j.contact||"", 人才计划:j.talentPlan||"", 待遇:j.pay||"", 考核:j.assess||"", 方向:j.kw||"", 材料清单:req, 调研笔记:(j.notes||"").slice(0,3000), 表格备注:(j.sheetNote||"").slice(0,1500), 招聘原文:(j.full||"").slice(0,5000)}; }},
+    {name:"find_jobs", description:"按关键词、状态或截止天数筛选职位，返回最多 40 条摘要。status 用英文状态码；within_days 表示截止在多少天内。", inputSchema:{type:"object", properties:{query:{type:"string"}, status:{type:"string"}, within_days:{type:"number"}}},
+      execute:({query, status, within_days}) => { const q = String(query||"").toLowerCase();
+        return [...S.jobs.entries()].filter(([,j]) => (!status || (j.status||"watch") === status) && (!q || [j.inst,j.alias,j.dept,j.title,j.city,j.kw,j.notes,(j.tags||[]).join(" ")].join(" ").toLowerCase().includes(q))
+          && (within_days === undefined || (daysUntil(j.deadline) !== null && daysUntil(j.deadline) >= 0 && daysUntil(j.deadline) <= Number(within_days)))).sort(byDeadline).slice(0,40).map(([id,j]) => jobOut(id,j)); }},
+    {name:"list_questions", description:"列出面试题库里的题目，可按分类或熟练程度（0 未准备，1 有草稿，2 熟练）筛选，返回题目和已有回答要点的开头。", inputSchema:{type:"object", properties:{category:{type:"string"}, level:{type:"number"}}},
+      execute:({category, level}) => [...S.qa.entries()].filter(([,x]) => (!category || x.cat === category) && (level === undefined || (x.level||0) === Number(level))).map(([id,x]) => ({id, 题目:x.q, 分类:x.cat, 熟练:["未准备","有草稿","熟练"][x.level||0], 回答要点:(x.a||"").slice(0,400)})) },
+    {name:"update_job", description:"修改一个职位：status（英文状态码）、prio（0-3）、deadline（YYYY-MM-DD）、add_tags（标签数组，只能用已有标签）、append_note（追加到调研笔记末尾的文字）。只在用户明确要求时使用。", inputSchema:{type:"object", properties:{id:{type:"string"}, status:{type:"string"}, prio:{type:"number"}, deadline:{type:"string"}, add_tags:{type:"array", items:{type:"string"}}, append_note:{type:"string"}}, required:["id"]},
+      execute:(a) => { const id = String(a.id); const j = S.jobs.get(id); if(!j) throw new Error("没有这个 id"); const p = {};
+        if(a.status !== undefined){ if(!ST[a.status]) throw new Error("状态码无效"); p.status = a.status; }
+        if(a.prio !== undefined){ p.prio = Math.max(0, Math.min(3, Math.round(Number(a.prio)) || 0)); }
+        if(a.deadline !== undefined){ if(a.deadline && !/^\d{4}-\d{2}-\d{2}$/.test(a.deadline)) throw new Error("日期格式应为 YYYY-MM-DD"); p.deadline = a.deadline; }
+        if(Array.isArray(a.add_tags)){ const ok = a.add_tags.filter(t => TAGS.includes(t)); p.tags = [...new Set([...(j.tags||[]), ...ok])]; }
+        if(a.append_note){ p.notes = ((j.notes||"") + (j.notes ? "\n" : "") + String(a.append_note)).slice(0, 20000); }
+        if(!Object.keys(p).length) return "没有要改的字段";
+        recordUndo("jobs", id); patch("jobs", id, p); refresh(); note(`修改了 ${jobName(j)}`); return "已更新：" + Object.keys(p).join("、"); }},
+    {name:"add_event", description:"添加一个日程。type：interview 初面 / flyout 校园面试 / talk 学术报告 / demo 试讲 / deadline offer答复截止 / other 其他。date 为 YYYY-MM-DD，time 为 HH:MM（可空），tz 为 IANA 时区（默认 Asia/Shanghai）。只在用户明确要求时使用。", inputSchema:{type:"object", properties:{job_id:{type:"string"}, type:{type:"string"}, date:{type:"string"}, time:{type:"string"}, tz:{type:"string"}, title:{type:"string"}, format:{type:"string"}, place:{type:"string"}, notes:{type:"string"}}, required:["type","date"]},
+      execute:(a) => { if(!/^\d{4}-\d{2}-\d{2}$/.test(a.date||"")) throw new Error("日期格式应为 YYYY-MM-DD"); if(a.job_id && !S.jobs.has(String(a.job_id))) throw new Error("没有这个职位 id");
+        const id = uid(); recordUndo("events", id);
+        S.events.set(id, {type:EVT[a.type] ? a.type : "other", jobId:a.job_id ? String(a.job_id) : "", date:a.date, time:/^\d{2}:\d{2}$/.test(a.time||"") ? a.time : "", tz:a.tz || LOCAL_TZ, title:a.title||"", format:a.format||"", place:a.place||"", notes:a.notes||"", createdAt:nowIso(), updatedAt:nowIso()});
+        save("events", id); refresh(); note(`添加了日程 ${a.date}`); return "已添加，id " + id; }},
+    {name:"add_question", description:"往面试题库添加一道题。category 用已有分类。只在用户明确要求时使用。", inputSchema:{type:"object", properties:{question:{type:"string"}, category:{type:"string"}, job_id:{type:"string"}}, required:["question"]},
+      execute:(a) => { const id = uid(); recordUndo("qa", id);
+        S.qa.set(id, {q:String(a.question), a:"", cat:QA_CATS.includes(a.category) ? a.category : "通用", level:0, jobId:a.job_id && S.jobs.has(String(a.job_id)) ? String(a.job_id) : "", createdAt:nowIso(), updatedAt:nowIso()});
+        save("qa", id); refresh(); note("添加了一道面试题"); return "已添加，id " + id; }},
+    {name:"save_answer", description:"把整理好的回答要点保存到题库里的某道题（会替换原有要点，可撤销），并可设置熟练程度 level（0/1/2）。只在用户要求保存时使用。", inputSchema:{type:"object", properties:{question_id:{type:"string"}, answer:{type:"string"}, level:{type:"number"}}, required:["question_id","answer"]},
+      execute:(a) => { const id = String(a.question_id); if(!S.qa.has(id)) throw new Error("没有这道题"); recordUndo("qa", id);
+        const p = {a:String(a.answer).slice(0, 20000)}; if(a.level !== undefined) p.level = Math.max(0, Math.min(2, Number(a.level)|0));
+        patch("qa", id, p); refresh(); note("保存了回答要点"); return "已保存"; }},
+  ];
+}
+function mdLite(t){
+  const lines = esc(t).replace(/\*\*(.+?)\*\*/g, "<b>$1</b>").replace(/`([^`]+)`/g, "<code>$1</code>").split("\n");
+  let out = "", list = null;
+  for(const ln of lines){
+    const m = /^\s*(?:[-•*]|(\d+)[.、])\s+(.*)$/.exec(ln);
+    if(m){ const tag = m[1] ? "ol" : "ul"; if(list !== tag){ if(list) out += `</${list}>`; out += `<${tag}>`; list = tag; } out += `<li>${m[2]}</li>`; continue; }
+    if(list){ out += `</${list}>`; list = null; }
+    if(/^#{1,4}\s+/.test(ln)) out += `<p><b>${ln.replace(/^#{1,4}\s+/, "")}</b></p>`;
+    else if(ln.trim()) out += `<p>${ln}</p>`;
+  }
+  if(list) out += `</${list}>`;
+  return out;
+}
+function aiNote(t){ const cur = AI.msgs[AI.msgs.length - 1]; if(cur && cur.role === "assistant"){ (cur.notes ||= []).push(t); drawAI(); } }
+function openAI(prefill){
+  AI.open = true; drawAI(true);
+  if(prefill){ const ta = $("#ai-input"); ta.value = prefill; ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); }
+}
+function closeAI(){ AI.open = false; if(AI.ctl) AI.ctl.abort(); drawAI(); }
+function drawAI(first){
+  const root = $("#ai-root"); if(!root) return;
+  $("#ai-fab").hidden = !S.sample || AI.open;
+  if(!AI.open){ root.innerHTML = ""; return; }
+  const keepInput = $("#ai-input") ? $("#ai-input").value : "";
+  const scrolled = $("#ai-log") ? $("#ai-log").scrollHeight - $("#ai-log").scrollTop - $("#ai-log").clientHeight > 40 : false;
+  root.innerHTML = `<aside class="ai-panel" role="dialog" aria-label="AI 助手">
+    <div class="ai-head"><b>问 AI</b><span class="status-line">能看到工作台里的职位、日程和题库</span>
+      <span style="margin-left:auto;display:flex;gap:4px"><button class="btn ghost sm" type="button" data-ai-new${AI.msgs.length ? "" : " disabled"}>新对话</button><button class="btn ghost sm" type="button" data-ai-close aria-label="关闭">关闭</button></span></div>
+    <div class="ai-log" id="ai-log" aria-live="polite">
+      ${AI.msgs.length ? AI.msgs.map((m, i) => m.role === "user" ? `<div class="ai-u">${esc(m.text)}</div>`
+        : `<div class="ai-a">${(m.notes || []).map(n => `<div class="ai-note">${esc(n)}</div>`).join("")}${m.text ? mdLite(m.text) : (m.err ? "" : `<p class="status-line">正在思考…</p>`)}${m.err ? `<p class="ai-err">${esc(m.err)}</p>` : ""}
+            ${m.undo ? `<button class="btn sm" type="button" data-ai-undo="${i}">撤销这次的 ${m.undo} 处修改</button>` : ""}</div>`).join("")
+        : `<div class="ai-empty"><p>可以问进度、让它整理计划、写段落，或者模拟面试。它只会在你明确要求时修改数据，改动可以撤销。</p>
+            <div class="ai-sugs">${AI_SUGGEST.map(q => `<button class="chip" type="button" data-ai-sug>${esc(q)}</button>`).join("")}</div></div>`}
+    </div>
+    <form class="ai-form" id="ai-form"><textarea id="ai-input" rows="2" placeholder="输入问题，Enter 发送，Shift+Enter 换行">${esc(keepInput)}</textarea>
+      <button class="btn primary" type="submit" id="ai-send">${AI.busy ? "停止" : "发送"}</button></form>
+  </aside>`;
+  const log = $("#ai-log"); if(!scrolled || first) log.scrollTop = log.scrollHeight;
+  if(first) $("#ai-input").focus();
+}
+async function sendAI(text){
+  if(AI.busy){ AI.ctl && AI.ctl.abort(); return; }
+  text = String(text || "").trim(); if(!text) return;
+  AI.msgs.push({role:"user", text}); const cur = {role:"assistant", text:"", notes:[]}; AI.msgs.push(cur);
+  AI.busy = true; AI.ctl = new AbortController(); AI.turnUndo = 0; const undoStart = AI.undo.length;
+  const ta = $("#ai-input"); if(ta) ta.value = ""; drawAI(true);
+  const hist = AI.msgs.slice(0, -1).filter(m => m.text).slice(-12).map(m => ({role:m.role, content:m.text}));
+  while(hist.length && hist[0].role !== "user") hist.shift();
+  const input = [{role:"user", content:aiRules()}, ...hist];
+  const useTools = !!(S.sampleLimits && S.sampleLimits.tools);
+  try {
+    const opts = {signal:AI.ctl.signal, cache:false, onText:({text:t}) => { cur.text = t; drawAI(); }};
+    if(useTools){ delete opts.cache; opts.tools = aiTools(); }
+    const r = await S.sample(input, opts);
+    cur.text = r.text; if(r.truncated) cur.err = "回答太长被截断了，可以让它分几次说。";
+  } catch(e){
+    cur.text = e && e.text ? e.text : cur.text;
+    cur.err = e && e.code === "cancelled" ? "已停止。" : (PARSE_ERR[e && e.code] || (e && e.code === "tools_unavailable" ? "这个视图不能让 AI 操作数据，只能回答问题。" : "出错了，稍后再试。"));
+  } finally {
+    AI.busy = false; AI.ctl = null;
+    const n = AI.undo.length - undoStart; if(n) cur.undo = n, cur.undoFrom = undoStart;
+    drawAI();
+  }
+}
+function undoAI(i){
+  const m = AI.msgs[i]; if(!m || !m.undo) return;
+  const items = AI.undo.splice(m.undoFrom, m.undo).reverse();
+  for(const u of items){
+    const key = collKey(u.coll);
+    if(u.prev){ S[key].set(u.id, u.prev); save(u.coll, u.id); } else remove(u.coll, u.id);
+  }
+  AI.msgs.forEach(x => { if(x.undoFrom > m.undoFrom) x.undoFrom -= m.undo; });
+  m.undo = 0; m.notes = [...(m.notes || []), "已撤销这次的修改"]; refresh(); drawAI(); toast("已撤销");
+}
+
+/* ---------- Backup ---------- */
+async function exportBackup(){
+  if(!S.downloads){ toast("这个视图不能保存文件。"); return; }
+  const data = { exportedAt:nowIso(), jobs:Object.fromEntries(S.jobs), events:Object.fromEntries(S.events), materials:Object.fromEntries(S.mats), qa:Object.fromEntries(S.qa) };
+  try { await S.downloads.save({filename:`job-market-backup-${todayStr()}.json`, data:JSON.stringify(data, null, 2)}); toast("备份已保存"); }
+  catch(e){ if(e && e.code !== "declined") toast("备份没有保存成功。"); }
+}
+
+/* ---------- Events ---------- */
+function refresh(){ render(); if(S.drawerJob) renderDrawer(false); }
+function newJob(){ const id = "m-" + uid(); S.jobs.set(id, {inst:"", dept:"", title:"", status:"watch", prio:0, req:{...DEFAULT_REQ}, portal:"", url:"", notes:"", deadline:"", source:"manual", createdAt:nowIso(), updatedAt:nowIso()}); save("jobs", id); openJob(id); }
+function armDelete(btn, fn){
+  if(btn.dataset.armed){ fn(); return; }
+  btn.dataset.armed = "1"; const old = btn.textContent; btn.textContent = "再点一次确认删除";
+  setTimeout(() => { if(btn.isConnected){ delete btn.dataset.armed; btn.textContent = old; } }, 3500);
+}
+
+document.addEventListener("click", e => {
+  if(e.target.closest("select, .selcell")) return;
+  const t = e.target.closest("button, [data-open-job], [data-edit-event], [data-edit-mat], a, label");
+  if(!t) return;
+  if(t.matches("[data-close-dlg]")){ closeDlg(); return; }
+  if(t.matches("[data-close-drawer]")){ closeDrawer(); return; }
+  if(t.id === "btn-import" || t.matches("[data-import]")){ importDialog(); return; }
+  if(t.matches("[data-new-job]")){ newJob(); return; }
+  if(t.matches("[data-new-event]")){ eventDialog(null, t.dataset.newEvent || ""); return; }
+  if(t.matches("[data-edit-event]")){ eventDialog(t.dataset.editEvent); return; }
+  if(t.matches("[data-new-mat]")){ matDialog(null, t.dataset.newMat || ""); return; }
+  if(t.matches("[data-edit-mat]")){ matDialog(t.dataset.editMat); return; }
+  if(t.matches("[data-open-job]")){ openJob(t.dataset.openJob); return; }
+  if(t.matches("[data-goto-status]")){ S.jobFilter.status = t.dataset.gotoStatus; S.jobFilter.q = ""; location.hash = "jobs"; if(S.view === "jobs") render(); return; }
+  if(t.matches("[data-del-event]")){ armDelete(t, () => { remove("events", t.dataset.delEvent); closeDlg(); refresh(); toast("已删除"); }); return; }
+  if(t.matches("[data-del-mat]")){ armDelete(t, () => { remove("materials", t.dataset.delMat); closeDlg(); refresh(); toast("已删除"); }); return; }
+  if(t.matches("[data-del-job]")){ armDelete(t, () => { const id = S.drawerJob; S.drawerJob = null; $("#drawer-root").innerHTML = ""; remove("jobs", id); render(); toast("已删除这个职位"); }); return; }
+  if(t.matches("[data-mat]") && S.drawerJob){ const j = S.jobs.get(S.drawerJob); const req = {...(j.req||{})}; const k = t.dataset.mat;
+    const nxt = {0:1, 1:2, 2:0}[req[k]||0]; if(nxt) req[k] = nxt; else delete req[k]; patch("jobs", S.drawerJob, {req}); refresh(); return; }
+  if(t.matches("[data-tag]") && S.drawerJob){ const j = S.jobs.get(S.drawerJob); const tg = t.dataset.tag; const cur = j.tags || [];
+    patch("jobs", S.drawerJob, {tags: cur.includes(tg) ? cur.filter(x => x !== tg) : [...cur, tg]}); refresh(); return; }
+  if(t.matches("[data-export]")){ exportBackup(); return; }
+  if(t.id === "ai-fab"){ openAI(); return; }
+  if(t.matches("[data-ai-close]")){ closeAI(); return; }
+  if(t.matches("[data-ai-new]")){ if(AI.ctl) AI.ctl.abort(); AI.msgs = []; drawAI(true); return; }
+  if(t.matches("[data-ai-sug]")){ sendAI(t.textContent); return; }
+  if(t.matches("[data-ai-undo]")){ undoAI(+t.dataset.aiUndo); return; }
+  if(t.matches("[data-ai-job]")){ const j = S.jobs.get(t.dataset.aiJob); closeDrawer(); openAI(`关于「${jobName(j)}${j.dept ? " " + j.dept : ""}」（id: ${t.dataset.aiJob}）：`); return; }
+  if(t.matches("[data-calmode]")){ S.calMode = t.dataset.calmode; lsSet("jd-calmode", S.calMode); render(); return; }
+  if(t.matches("[data-cal-nav]")){ const k = +t.dataset.calNav; if(!k){ S.calMonth = todayStr().slice(0,7); S.calDay = todayStr(); }
+    else { const [y, m] = (S.calMonth || todayStr().slice(0,7)).split("-").map(Number); const d = new Date(y, m - 1 + k, 1); S.calMonth = `${d.getFullYear()}-${pad(d.getMonth()+1)}`; S.calDay = ""; } render(); return; }
+  if(t.matches("[data-day]")){ S.calDay = t.dataset.day; render(); const p = document.querySelector(".month + .panel"); p && p.scrollIntoView({block:"nearest", behavior:"smooth"}); return; }
+  if(t.matches("[data-new-event-day]")){ eventDialog(null, "", t.dataset.newEventDay); return; }
+  if(t.matches("[data-dismiss]")){ dismiss(t.dataset.dismiss); render(); return; }
+  if(t.matches("[data-jobview]")){ S.jobView = t.dataset.jobview; lsSet("jd-jobview", S.jobView); S.sel.clear(); render(); return; }
+  if(t.matches("[data-kb-fold]")){ S.kbClosed = !S.kbClosed; render(); return; }
+  if(t.matches("[data-bulk-clear]")){ S.sel.clear(); render(); return; }
+  if(t.matches("[data-bulk-del]")){ armDelete(t, () => { const n = S.sel.size; [...S.sel].forEach(id => remove("jobs", id)); S.sel.clear(); render(); toast(`已删除 ${n} 个职位`); }); return; }
+  if(t.matches("[data-show-new]")){ S.jobFilter = {...S.jobFilter, onlyNew:true, status:"all", q:"", tag:""}; location.hash = "jobs"; if(S.view === "jobs") render(); return; }
+  if(t.matches("[data-clear-new]")){ S.jobFilter.onlyNew = false; S.jobFilter.status = "active"; render(); return; }
+  if(t.matches("[data-ed-del]")){ const row = t.closest("[data-i]"), kind = t.closest("[data-list]").dataset.list, i = +row.dataset.i;
+    armDelete(t, () => editList(kind, (arr) => { const [gone] = arr.splice(i, 1);
+      if(kind === "qaCats") for(const [id, x] of S.qa){ if(x.cat === gone) patch("qa", id, {cat:"通用"}); }
+      if(kind === "tags") for(const [id, j] of S.jobs){ if((j.tags || []).includes(gone)) patch("jobs", id, {tags:j.tags.filter(x => x !== gone)}); } })); return; }
+  if(t.matches("[data-ed-up]")){ const kind = t.closest("[data-list]").dataset.list, i = +t.closest("[data-i]").dataset.i;
+    editList(kind, arr => { if(i > 0) [arr[i-1], arr[i]] = [arr[i], arr[i-1]]; }); return; }
+  if(t.matches("[data-qa-cat]")){ S.qaCat = t.dataset.qaCat; render(); return; }
+  if(t.matches("[data-new-qa]")){ const id = uid(); S.qa.set(id, {q:"", a:"", cat:S.qaCat === "全部" ? "通用" : S.qaCat, level:0, jobId:"", createdAt:nowIso()}); save("qa", id); S.openQa = id; render(); const el = document.getElementById("qa-q-"+id); el && el.focus(); return; }
+  if(t.matches("[data-qa-level]")){ const id = t.closest("[data-qa]").dataset.qa; S.openQa = id; patch("qa", id, {level:+t.dataset.qaLevel}); render(); return; }
+  if(t.matches("[data-del-qa]")){ const id = t.closest("[data-qa]").dataset.qa; armDelete(t, () => { remove("qa", id); render(); }); return; }
+  if(t.id === "imp-more"){ IMP.limit += 300; renderImport(); return; }
+  if(t.id === "imp-paste-go"){ readPasted(); return; }
+  if(t.id === "sheet-go"){ applySheet(); return; }
+  if(t.matches("[data-parse]")){ parseDialog(); return; }
+  if(t.id === "parse-go"){ runParse(); return; }
+  if(t.id === "parse-save"){ saveParsed(); return; }
+  if(t.matches("[data-rm-img]")){ PARSE.images.splice(+t.dataset.rmImg, 1); drawThumbs(); return; }
+  if(t.matches("[data-triage]")){ e.stopPropagation(); patch("jobs", t.dataset.id, {status:t.dataset.triage}); render(); toast(t.dataset.triage === "watch" ? "已移到“待定”" : "已标记为不申请"); return; }
+  if(t.id === "imp-go"){ runImport(); return; }
+});
+/* Board drag and drop */
+let dragId = null;
+document.addEventListener("dragstart", e => { const c = e.target.closest && e.target.closest("[data-card]"); if(!c) return; dragId = c.dataset.card; c.classList.add("dragging");
+  try { e.dataTransfer.setData("text/plain", dragId); e.dataTransfer.effectAllowed = "move"; } catch {} });
+document.addEventListener("dragend", e => { const c = e.target.closest && e.target.closest("[data-card]"); if(c) c.classList.remove("dragging"); document.querySelectorAll(".kcol.over").forEach(x => x.classList.remove("over")); dragId = null; });
+document.addEventListener("dragover", e => { const col = e.target.closest && e.target.closest("[data-col]"); if(!col || !dragId) return; e.preventDefault();
+  document.querySelectorAll(".kcol.over").forEach(x => x !== col && x.classList.remove("over")); col.classList.add("over"); });
+document.addEventListener("drop", e => { const col = e.target.closest && e.target.closest("[data-col]"); if(!col || !dragId) return; e.preventDefault();
+  const st = col.dataset.col, id = dragId; dragId = null; col.classList.remove("over");
+  if((S.jobs.get(id) || {}).status !== st){ setStatusMany([id], st); toast(`已移到“${ST[st].l}”`); render(); } });
+document.addEventListener("submit", e => {
+  if(e.target.id === "ai-form"){ e.preventDefault(); sendAI($("#ai-input").value); return; }
+  const f = e.target.closest("[data-ed-add]"); if(!f) return;
+  e.preventDefault(); const kind = f.dataset.edAdd; const v = f.querySelector("input").value.trim(); if(!v) return;
+  editList(kind, arr => { if(kind === "materials") arr.push({k:"c-" + uid(), l:v, def:false}); else if(!arr.includes(v)) arr.push(v); });
+  const inp = $(`[data-ed-add="${kind}"] input`); inp && inp.focus();
+});
+document.addEventListener("keydown", e => {
+  if(e.target.id === "ai-input" && e.key === "Enter" && !e.shiftKey && !e.isComposing){ e.preventDefault(); sendAI(e.target.value); return; }
+  if(e.key === "Escape" && AI.open && !dlg.open && !S.drawerJob){ closeAI(); return; }
+  if(e.key === "Escape" && S.drawerJob && !dlg.open){ closeDrawer(); return; }
+  if((e.key === "Enter" || e.key === " ") && e.target.matches("[data-open-job],[data-edit-event],[data-edit-mat]") && e.target.tagName !== "BUTTON"){ e.preventDefault(); e.target.click(); }
+});
+document.addEventListener("toggle", e => { const d = e.target; if(d.matches && d.matches("details[data-qa]")){ if(d.open) S.openQa = d.dataset.qa; else if(S.openQa === d.dataset.qa) S.openQa = null; } }, true);
+
+document.addEventListener("input", e => {
+  const t = e.target;
+  if(t.id === "job-q"){ S.jobFilter.q = t.value; render(); return; }
+  if(t.matches("[data-jf]") && S.drawerJob && (t.tagName === "TEXTAREA" || t.type === "text" || t.type === "url")){ patch("jobs", S.drawerJob, {[t.dataset.jf]: t.value}, 800); render(); return; }
+  if(t.matches("[data-qa-field]") && (t.tagName === "TEXTAREA" || t.type === "text")){ const id = t.closest("[data-qa]").dataset.qa; S.openQa = id; patch("qa", id, {[t.dataset.qaField]: t.value}, 800);
+    if(t.dataset.qaField === "q"){ const q = t.closest("details").querySelector("summary .q"); q.firstChild.nodeValue = t.value || "新问题"; } return; }
+  if(t.matches("[data-pf]") && PARSE && PARSE.results){ PARSE.results[+t.closest("[data-pi]").dataset.pi][t.dataset.pf] = t.value; return; }
+  if(t.id === "imp-q"){ IMP.q = t.value; IMP.limit = 300; clearTimeout(renderImport._t); renderImport._t = setTimeout(() => { renderImport(); const el = $("#imp-q"); el.focus(); el.setSelectionRange(el.value.length, el.value.length); }, 200); return; }
+});
+document.addEventListener("change", e => {
+  const t = e.target;
+  if(t.id === "job-status"){ S.jobFilter.status = t.value; render(); return; }
+  if(t.id === "job-sort"){ S.jobFilter.sort = t.value; render(); return; }
+  if(t.id === "cal-dl"){ S.calDeadlines = t.checked; render(); return; }
+  if(t.id === "cal-past"){ S.calPast = t.checked; render(); return; }
+  if(t.matches("[data-jf]") && S.drawerJob && (t.tagName === "SELECT" || t.type === "date")){ const v = t.dataset.jf === "prio" ? +t.value : t.value; patch("jobs", S.drawerJob, {[t.dataset.jf]: v}); refresh(); return; }
+  if(t.matches("[data-jf]") && S.drawerJob){ save("jobs", S.drawerJob); return; }
+  if(t.matches("[data-qa-field]") && t.tagName === "SELECT"){ const id = t.closest("[data-qa]").dataset.qa; S.openQa = id; patch("qa", id, {[t.dataset.qaField]: t.value}); render(); return; }
+  if(t.matches("[data-qa-field]")){ const id = t.closest("[data-qa]").dataset.qa; save("qa", id); return; }
+  if(t.matches("[data-ed-label]")){ const kind = t.closest("[data-list]").dataset.list, i = +t.closest("[data-i]").dataset.i, v = t.value.trim();
+    if(!v){ t.value = t.dataset.old; return; }
+    const old = t.dataset.old; editList(kind, arr => { if(kind === "materials") arr[i].l = v; else arr[i] = v; }); renameRef(kind, old, v); return; }
+  if(t.matches("[data-ed-def]")){ const i = +t.closest("[data-i]").dataset.i; editList("materials", arr => { arr[i].def = t.checked; }); return; }
+  if(t.matches("[data-pref]")){ savePref(t.dataset.pref, t.value); toast("已保存，下一次检索生效"); return; }
+  if(t.id === "job-tag"){ S.jobFilter.tag = t.value; render(); return; }
+  if(t.matches("[data-sel]")){ t.checked ? S.sel.add(t.dataset.sel) : S.sel.delete(t.dataset.sel); render(); return; }
+  if(t.id === "sel-all"){ filteredJobs().forEach(([id]) => t.checked ? S.sel.add(id) : S.sel.delete(id)); render(); return; }
+  if(t.matches("[data-bulk]") && t.value !== ""){ const ids = [...S.sel], kind = t.dataset.bulk, v = t.value;
+    if(kind === "status") setStatusMany(ids, v);
+    if(kind === "prio") ids.forEach(id => patch("jobs", id, {prio:+v}));
+    if(kind === "tag") ids.forEach(id => { const j = S.jobs.get(id); const cur = j.tags || []; if(!cur.includes(v)) patch("jobs", id, {tags:[...cur, v]}); });
+    toast(`已更新 ${ids.length} 个职位`); render(); return; }
+  if(t.matches("[data-move]") && t.value){ const id = t.dataset.move; setStatusMany([id], t.value); toast(`已移到“${ST[t.value].l}”`); render(); return; }
+  if(t.matches("[data-map]") && SHEET){ SHEET.map[t.dataset.map] = t.value === "" ? undefined : +t.value; sheetParse(); renderSheet(); return; }
+  if(t.matches("[data-sr-keep]") && SHEET){ SHEET.parsed[+t.closest("[data-sr]").dataset.sr].keep = t.checked; renderSheet(); return; }
+  if(t.matches("[data-sr-date]") && SHEET){ const r = SHEET.parsed[+t.closest("[data-sr]").dataset.sr]; r.deadline = t.value; r.warn = ""; renderSheet(); return; }
+  if(t.matches("[data-sr-target]") && SHEET){ const r = SHEET.parsed[+t.closest("[data-sr]").dataset.sr]; r.target = t.value; r.sure = true; r.how = t.value === "new" ? "" : "手动选择"; renderSheet(); return; }
+  if(t.matches("[data-pkeep]")){ PARSE.results[+t.closest("[data-pi]").dataset.pi]._keep = t.checked; return; }
+  if(t.matches("[data-pf]") && PARSE && PARSE.results){ PARSE.results[+t.closest("[data-pi]").dataset.pi][t.dataset.pf] = t.value; return; }
+  if(t.id === "imp-sec"){ IMP.section = t.value; IMP.limit = 300; renderImport(); return; }
+  if(t.id === "imp-future"){ IMP.futureOnly = t.checked; renderImport(); return; }
+  if(t.id === "imp-china"){ IMP.china = t.checked; IMP.limit = 300; renderImport(); return; }
+  if(t.id === "imp-all"){ impFiltered().forEach(([i]) => t.checked ? IMP.sel.add(i) : IMP.sel.delete(i)); renderImport(); return; }
+  if(t.matches("[data-imp]")){ const i = +t.dataset.imp; t.checked ? IMP.sel.add(i) : IMP.sel.delete(i);
+    const go = $("#imp-go"); go.disabled = !IMP.sel.size; go.textContent = `导入所选 ${IMP.sel.size} 个职位`; return; }
+});
+
+/* ---------- Boot ---------- */
+setView(location.hash.slice(1) || "overview");
+(async () => {
+  const db = window.claude && window.claude.use ? await window.claude.use("db") : null;
+  if(!db){ window.__showSetup(); return; }
+  S.db = db;
+  try { S.downloads = await window.claude.use("downloads"); } catch {}
+  try { S.sample = await window.claude.use("sample"); if(S.sample){ S.sampleLimits = await S.sample.limits().catch(() => null); $("#btn-parse").hidden = false; drawAI(); } } catch {}
+  const sub = (coll, key) => db.collection(coll).onSnapshot(snap => {
+    let changed = false;
+    for(const ch of snap.docChanges()){
+      const id = ch.doc.id; const path = `${coll}/${id}`;
+      if(timers.has(path)) continue; // a local edit is waiting to be saved; it wins
+      if(ch.type === "removed"){ S[key].delete(id); changed = true; }
+      else { const d = ch.doc.data(); const cur = S[key].get(id); if(!cur || JSON.stringify(cur) !== JSON.stringify(d)){ S[key].set(id, {...d}); changed = true; } }
+    }
+    const first = !S.loaded[key]; S.loaded[key] = true;
+    if(key === "meta" && (first || changed)) applySettings();
+    if(first || changed){
+      render();
+      if(S.drawerJob && key !== "qa"){ const a = document.activeElement; const typing = a && $("#drawer-root").contains(a) && (a.tagName === "TEXTAREA" || a.tagName === "INPUT");
+        if(!typing) renderDrawer(false); }
+    }
+  }, err => { console.error(err); if(err.code === "revoked") { S.denied = true; render(); } else toast("数据同步中断，请刷新页面。"); });
+  sub("jobs","jobs"); sub("events","events"); sub("materials","mats"); sub("qa","qa"); sub("meta","meta");
+  setTimeout(() => { if(!allLoaded()){ const el = $("#boot"); if(el) el.innerHTML = "<strong>还在等待数据…</strong>如果一直停在这里，你可能不是这个页面的所有者，或者需要刷新。"; } }, 8000);
+  setInterval(() => { if(!document.hidden && S.view !== "prep") render(); }, 60 * 60 * 1000); // roll the day over
+})();
+})();
+</script>
+
+</body>
+</html>
