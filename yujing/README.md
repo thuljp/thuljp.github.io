@@ -1,6 +1,6 @@
 # 语境 · 场景式语言学习（法语 / 日语）
 
-thuljp.github.io 上的一个纯静态网页应用，手机上可以"添加到主屏幕"当 App 用。
+apps.lijinpu.com（原 thuljp.github.io）上的一个纯静态网页应用，手机上可以"添加到主屏幕"当 App 用。
 所有学习记录保存在你自己的浏览器里；AI 功能用你自己的 API Key，按量付费。
 
 ---
@@ -33,9 +33,9 @@ thuljp.github.io 上的一个纯静态网页应用，手机上可以"添加到�
 
 ---
 
-## 二、在 thuljp.github.io 上的位置
+## 二、在网站上的位置
 
-语境是 `thuljp.github.io` 网站下的一个应用，网址 `https://thuljp.github.io/yujing/`，和 Job Desk（`/jobdesk/`）并列，从网站首页进入。
+语境是 `apps.lijinpu.com`（原 `thuljp.github.io`）网站下的一个应用，网址 `https://apps.lijinpu.com/yujing/`，和 Job Desk（`/jobdesk/`）并列，从网站首页进入。
 
 更新方式：在本地 `Github_Apps/thuljp.github.io/yujing/` 里改文件 → 双击 `Github_Apps/本地预览.bat` 看效果 → 双击 `Github_Apps/一键发布.bat` 推送到 GitHub。一两分钟后网站生效。学习记录在浏览器里，更新代码不影响记录。
 
@@ -102,7 +102,7 @@ DeepSeek 不允许网页直接调用（浏览器跨域限制），需要一个�
    - Repository access：Only select repositories → 勾 `yujing-data`
    - Permissions → Repository permissions → Contents：**Read and write**
    - 也可以编辑 Job Desk 用的那个令牌，把 `yujing-data` 加进 Repository access，两个应用共用一个令牌（语境设置里有"填入 Job Desk 的令牌"按钮）。
-3. 打开 https://thuljp.github.io/yujing/ ，会先看到连接页：粘贴令牌（或点"填入 Job Desk 的令牌"）→ **连接**。
+3. 打开 https://apps.lijinpu.com/yujing/ ，会先看到连接页：粘贴令牌（或点"填入 Job Desk 的令牌"）→ **连接**。
 4. 手机等其他设备一样：打开网址，填同一个令牌即可，进度会自动取回来。
 
 和 Job Desk 一样，语境是**私人应用**：网页代码公开，但没有连接你私有仓库的设备只能看到连接页，用不了任何功能。想让某台设备退出，到 设置 → 私有仓库同步 → **断开这台设备**。

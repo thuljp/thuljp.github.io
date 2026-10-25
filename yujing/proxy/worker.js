@@ -1,4 +1,4 @@
-// thuljp.github.io 全站共用的 AI 中转（Cloudflare Workers）
+// apps.lijinpu.com（原 thuljp.github.io）全站共用的 AI 中转（Cloudflare Workers）
 // 同时服务 Job Desk 和 语境：
 //   - 默认转发到 DeepSeek（/chat/completions、/v1/tools/search、/v1/tools/fetch），和 Job Desk 原来的中转完全兼容；
 //   - 语境选用通义、Kimi 等其他服务商时，会带上 X-Target-Base 头，这里按白名单转发。
@@ -7,7 +7,7 @@
 // 部署：Cloudflare → Workers & Pages → 你原来给 Job Desk 建的 Worker（或新建一个）→ Edit code，
 // 把内容替换成这个文件 → Deploy。两个应用都填这个 Worker 的地址即可。
 
-const ALLOWED_ORIGINS = ['https://thuljp.github.io'];   // 本地预览时想用 AI，可临时加上 'http://localhost:8000'
+const ALLOWED_ORIGINS = ['https://apps.lijinpu.com', 'https://thuljp.github.io'];   // 本地预览时想用 AI，可临时加上 'http://localhost:8000'
 const DEFAULT_UPSTREAM = 'https://api.deepseek.com';
 const ALLOWED_HOSTS = [
   'api.deepseek.com',
