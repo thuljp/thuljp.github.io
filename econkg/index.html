@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<!-- 不让搜索引擎收录；数据在私有仓库，需要令牌才能看到 -->
+<meta name="robots" content="noindex,nofollow">
+<title>经济学知识图谱</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Schibsted+Grotesk:wght@400;500;600;700&display=swap" media="print" onload="this.media='all'">
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<header class="top">
+  <div class="top-in">
+    <div class="brand">
+      <a class="home" href="../">apps.lijinpu.com</a>
+      <h1>经济学知识图谱</h1>
+      <span class="sum" id="sum">数据经济 · 试点</span>
+    </div>
+    <nav class="tabs" aria-label="页面">
+      <a href="#graph">图谱</a>
+      <a href="#cards">模式卡片</a>
+      <a href="#papers">论文</a>
+      <a href="#trends">演化</a>
+      <a href="#about">方法与质量</a>
+      <a href="#settings">设置</a>
+    </nav>
+  </div>
+</header>
+<main>
+  <section class="view" id="view-graph"><p class="empty">加载中…</p></section>
+  <section class="view" id="view-cards" hidden></section>
+  <section class="view" id="view-papers" hidden></section>
+  <section class="view" id="view-trends" hidden></section>
+  <section class="view" id="view-about" hidden></section>
+  <section class="view" id="view-settings" hidden></section>
+</main>
+<aside class="drawer" id="drawer" hidden aria-label="论文详情"></aside>
+<script src="js/vendor/cytoscape.min.js"></script>
+<script type="module" src="js/app.js"></script>
+</body>
+</html>
