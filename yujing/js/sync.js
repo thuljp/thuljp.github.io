@@ -34,7 +34,7 @@ async function req(url, opts) {
   let r;
   try { r = await fetch(url, { cache: 'no-store', ...opts }); }
   catch { throw new SyncError('连不上 GitHub，检查网络。', 'net'); }
-  if (r.status === 401) throw new SyncError('令牌无效或已过期，请在设置里换一个新的。', 'auth');
+  if (r.status === 401) throw new SyncError('令牌无效或已过期，请到 GitHub 重新生成一个。', 'auth');
   if (r.status === 403) throw new SyncError('令牌没有写入权限：需要这个仓库的 Contents 读写权限。', 'auth');
   return r;
 }
@@ -116,8 +116,8 @@ export function syncNow() {
       lastSyncAt = Date.now();
       setStatus('ok', '已同步 ' + hhmm());
     } catch (e) {
+      if (e.code === 'auth') { const cc = syncCfg(); cc.enabled = false; saveSyncCfg(cc); }   // 先锁定，再通知界面
       setStatus('error', e instanceof SyncError ? e.message : '同步出错：' + (e.message || e));
-      if (e.code === 'auth') { const cc = syncCfg(); cc.enabled = false; saveSyncCfg(cc); }
     } finally {
       running = null;
       if (changedLocal) onRemoteChange();
@@ -131,7 +131,7 @@ export function syncNow() {
 // 启动：打开时拉取一次；学习时改动 20 秒后推送；切到后台时推送；回到前台时拉取
 let started = false;
 export function startSync(onChangeFromRemote) {
-  onRemoteChange = onChangeFromRemote || (() => {});
+  if (onChangeFromRemote) onRemoteChange = onChangeFromRemote;
   syncNow();
   if (started) return;
   started = true;

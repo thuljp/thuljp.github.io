@@ -16,7 +16,6 @@ export function renderSettings(el) {
   const jdTok = jobdeskToken();
 
   el.innerHTML = `${header('设置')}
-  ${st.onboarded ? '' : '<p class="lede">在别的设备上学过的话，先在下面"多设备同步"里连接私有仓库，进度会自动取回来。新开始学的话，<a href="#/welcome">回到首次设置</a>。</p>'}
 
   <section class="panel" data-plan>
     <h2>学习计划</h2>
@@ -72,7 +71,7 @@ export function renderSettings(el) {
   </section>
 
   <section class="panel" id="sync">
-    <h2>多设备同步 <span class="muted" id="sync-text">${esc(syncStatus().text)}</span></h2>
+    <h2>私有仓库同步 <span class="muted" id="sync-text">${esc(syncStatus().text)}</span></h2>
     <p>学习进度保存到你的<b>私有</b> GitHub 仓库里，电脑和手机自动同步。令牌只保存在这台设备的浏览器里。</p>
     <details ${sc.enabled ? '' : 'open'}><summary>第一次设置怎么做</summary>
       <ol class="steps">
@@ -84,7 +83,7 @@ export function renderSettings(el) {
     <div class="field"><span class="label">GitHub 令牌</span><input id="stoken" type="password" value="${esc(sc.token)}" autocomplete="off" placeholder="github_pat_…"></div>
     ${jdTok && jdTok !== sc.token ? '<button class="btn small ghost" id="usejdtok">填入 Job Desk 的令牌</button>' : ''}
     <div class="row">${sc.enabled
-      ? '<button class="btn primary" id="snow">立即同步</button><button class="btn ghost" id="soff">关闭同步</button>'
+      ? '<button class="btn primary" id="snow">立即同步</button><button class="btn ghost" id="soff">断开这台设备</button>'
       : '<button class="btn primary" id="son">测试并开启</button>'}</div>
     <p class="test-out" id="sout" aria-live="polite"></p>
   </section>
@@ -145,9 +144,9 @@ export function renderSettings(el) {
   };
   const soff = q('#soff');
   if (soff) soff.onclick = () => {
-    if (!confirm('关闭后这台设备不再同步（本地记录和私有仓库里的记录都保留）。确定吗？')) return;
-    saveSyncCfg({ ...syncCfg(), enabled: false });
-    syncNow(); renderSettings(el);
+    if (!confirm('断开后这台设备会锁定，需要重新填令牌才能使用。私有仓库里的记录都保留。确定吗？')) return;
+    saveSyncCfg({ ...syncCfg(), enabled: false, token: '' });
+    syncNow(); location.hash = '#/today';
   };
   el.querySelectorAll('[data-active]').forEach(cb => cb.onchange = () => {
     st.active[cb.dataset.active] = cb.checked;

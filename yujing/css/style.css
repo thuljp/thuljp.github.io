@@ -89,7 +89,9 @@ main#view { max-width: 680px; margin: 0 auto; padding: 20px 16px 40px; }
 #nav a { display: flex; flex-direction: column; align-items: center; gap: 2px; padding: 9px 0 8px; font-size: .72rem; color: var(--muted); text-decoration: none; }
 #nav a svg { width: 22px; height: 22px; }
 #nav a.on { color: var(--acc); }
-body.focus-mode #nav { display: none; }
+body.focus-mode #nav, body.locked #nav, body.locked .top-right { display: none; }
+body.locked { padding-bottom: 24px; }
+@media (min-width: 960px) { body.locked { padding-left: 0; } body.locked #nav { display: none; } }
 body.focus-mode { padding-bottom: 24px; }
 
 @media (min-width: 960px) {

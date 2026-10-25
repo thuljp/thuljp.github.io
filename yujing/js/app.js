@@ -2,7 +2,7 @@ import { S, save, LANGS, counts, scenesOf, sceneState, studiedOn, todayTotal as 
 import { aiReady } from './ai.js';
 import { stop } from './speech.js';
 import { startReminderLoop } from './reminder.js';
-import { startSync, onSyncStatus } from './sync.js';
+import { startSync, onSyncStatus, syncCfg, saveSyncCfg, testRepo, syncNow, syncStatus, jobdeskToken } from './sync.js';
 import { esc, dayKey, addDays } from './util.js';
 import { ICON, bindSay, tl, fmtMin } from './ui.js';
 import { renderReview } from './views/review.js';
@@ -34,9 +34,14 @@ langSwitch.onclick = e => {
   else route();
 };
 
+// 私人应用：这台设备连接过你的私有仓库（有有效令牌）才能使用，和 Job Desk 一样
+const unlocked = () => { const c = syncCfg(); return c.enabled && !!c.token; };
+
 function route() {
   stop();
   const st = S();
+  document.body.classList.toggle('locked', !unlocked());
+  if (!unlocked()) { document.body.classList.remove('focus-mode'); window.scrollTo(0, 0); return renderGate(view); }
   if (!st.onboarded && !/^#\/(welcome|settings)/.test(location.hash)) { location.hash = '#/welcome'; return; }
   const [path, query] = (location.hash.slice(2) || 'today').split('?');
   const parts = path.split('/');
@@ -138,6 +143,46 @@ function heroPhrase(lang) {
   return list[new Date().getDate() % list.length];
 }
 
+// ---------- 锁屏：连接私有仓库 ----------
+function renderGate(el) {
+  const c = syncCfg();
+  const jdTok = jobdeskToken();
+  el.innerHTML = `
+    <section class="welcome gate">
+      <h1 class="brand-big">语境</h1>
+      <p class="lede">这是私人应用。学习进度保存在私有仓库 <b>${esc(c.owner)}/${esc(c.repo)}</b> 里，用有权限的 GitHub 令牌连接后才能使用。</p>
+      <div class="field"><span class="label">GitHub 令牌</span><input id="gtoken" type="password" autocomplete="off" placeholder="github_pat_…" value="${esc(c.token)}"></div>
+      ${jdTok ? '<button class="btn small ghost" id="gjd">填入 Job Desk 的令牌</button>' : ''}
+      <details><summary>换一个仓库</summary><div class="field"><input id="grepo" type="text" spellcheck="false" value="${esc(c.owner + '/' + c.repo)}"></div></details>
+      <button class="btn primary wide" id="gopen">连接</button>
+      <p class="test-out" id="gout" aria-live="polite">${syncStatus().kind === 'error' ? `<span class="err-text">${esc(syncStatus().text)}</span>` : ''}</p>
+      <p class="hint">令牌只保存在这台设备的浏览器里。第一次用的话，私有仓库和令牌的准备步骤见 README 第六节。</p>
+      <p class="hint"><a href="../">返回网站首页</a></p>
+    </section>`;
+  const out = el.querySelector('#gout');
+  const jd = el.querySelector('#gjd');
+  if (jd) jd.onclick = () => { el.querySelector('#gtoken').value = jdTok; jd.remove(); };
+  el.querySelector('#gopen').onclick = async e => {
+    const token = el.querySelector('#gtoken').value.trim();
+    const [owner, repo] = el.querySelector('#grepo').value.trim().split('/').map(x => (x || '').trim());
+    if (!token) { out.innerHTML = '<span class="err-text">先填入 GitHub 令牌。</span>'; return; }
+    const cfg = { ...syncCfg(), owner: owner || 'thuljp', repo: repo || 'yujing-data', token };
+    const b = e.currentTarget; b.disabled = true; b.textContent = '连接中…';
+    try {
+      const info = await testRepo(cfg);
+      if (!info.private) throw new Error(`${cfg.owner}/${cfg.repo} 是公开仓库。请到仓库 Settings 把它改成 Private 再连接。`);
+      saveSyncCfg({ ...cfg, branch: info.branch, enabled: true });
+      await syncNow();
+      if (syncStatus().kind === 'error') { saveSyncCfg({ ...syncCfg(), enabled: false }); throw new Error(syncStatus().text); }
+      const target = S().onboarded ? '#/today' : '#/welcome';
+      if (location.hash === target) route(); else location.hash = target;
+    } catch (err) {
+      out.innerHTML = `<span class="err-text">${esc(err.message)}</span>`;
+      b.disabled = false; b.textContent = '连接';
+    }
+  };
+}
+
 // ---------- 首次设置 ----------
 function renderWelcome(el) {
   const st = S();
@@ -158,7 +203,6 @@ function renderWelcome(el) {
       <p class="hint">稍后可以在"设置"里把提醒加到手机日历。</p>
 
       <button class="btn primary wide" id="go">开始学习</button>
-      <p class="hint center" style="margin-top:16px">已经在电脑或手机上学过？<a href="#/settings">先连接私有仓库，取回学习进度</a></p>
     </section>`;
   el.querySelector('#go').onclick = () => {
     const langs = [...el.querySelectorAll('[name=lang]:checked')].map(i => i.value);
@@ -191,6 +235,7 @@ onSyncStatus(s => {
   syncDot.dataset.kind = s.kind;
   syncDot.title = s.text;
   syncDot.setAttribute('aria-label', '同步状态：' + s.text);
+  if (s.kind === 'error' && !unlocked() && !document.body.classList.contains('locked')) route();   // 令牌失效：立即锁定
 });
 startSync(() => {
   const page = (location.hash.slice(2) || 'today').split(/[/?]/)[0];
