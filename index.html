@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<!-- 不让搜索引擎收录这个页面；想被搜到就删掉下面这一行 -->
+<meta name="robots" content="noindex,nofollow">
+<title>thuljp 的网页应用</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Schibsted+Grotesk:wght@400;500;600;700&display=swap">
+<style>
+:root{
+  --bg:#F2F4F6; --surface:#FFFFFF; --ink:#15202B; --muted:#5A6676; --line:#DCE1E7; --accent:#0E6B63; --accent-soft:#DFF0ED;
+  --font:"Schibsted Grotesk",system-ui,-apple-system,"PingFang SC","Microsoft YaHei","Noto Sans SC",sans-serif;
+  color-scheme:light;
+}
+@media (prefers-color-scheme: dark){
+  :root{ --bg:#11161C; --surface:#182029; --ink:#E6EBF0; --muted:#A1ACB9; --line:#2B3541; --accent:#5FC2B5; --accent-soft:#17312E; color-scheme:dark; }
+}
+*,*::before,*::after{box-sizing:border-box}
+body{margin:0; background:var(--bg); color:var(--ink); font:400 15px/1.6 var(--font)}
+main{max-width:760px; margin:0 auto; padding:56px max(20px,env(safe-area-inset-right,0px)) 64px max(20px,env(safe-area-inset-left,0px))}
+.site{font-size:13px; color:var(--muted); margin:0 0 6px}
+h1{font-size:28px; font-weight:650; letter-spacing:-.015em; margin:0 0 6px}
+.lead{color:var(--muted); margin:0 0 28px}
+.apps{list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:10px}
+.app{display:grid; grid-template-columns:44px minmax(0,1fr) auto; gap:14px; align-items:center; padding:14px 16px; background:var(--surface);
+  border:1px solid var(--line); border-radius:10px; text-decoration:none; color:inherit}
+.app:hover{border-color:var(--accent)}
+.app:focus-visible{outline:2px solid var(--accent); outline-offset:2px}
+.mark{width:44px; height:44px; border-radius:10px; background:var(--accent-soft); color:var(--accent); display:grid; place-items:center; font-weight:700; font-size:17px}
+.name{font-weight:600; font-size:16px}
+.desc{color:var(--muted); font-size:13.5px}
+.path{font-size:12.5px; color:var(--muted); white-space:nowrap}
+.tag{display:inline-block; font-size:11.5px; padding:0 7px; border-radius:999px; background:var(--accent-soft); color:var(--accent); margin-left:6px; vertical-align:2px; font-weight:500}
+footer{margin-top:40px; font-size:13px; color:var(--muted)}
+footer a{color:var(--accent)}
+@media (max-width:520px){ .app{grid-template-columns:40px minmax(0,1fr)} .path{grid-column:2} .mark{width:40px; height:40px} }
+</style>
+</head>
+<body>
+<main>
+  <p class="site">thuljp.github.io</p>
+  <h1>网页应用</h1>
+  <p class="lead">部署在这个网站上的工具，点开即用。</p>
+
+  <ul class="apps">
+    <li>
+      <a class="app" href="/jobdesk/">
+        <span class="mark" aria-hidden="true">J</span>
+        <span><span class="name">Job Market Desk</span><span class="tag">私人</span><br>
+          <span class="desc">求职工作台：职位跟踪、截止提醒、日程和面试准备。需要令牌才能看到数据。</span></span>
+        <span class="path">/jobdesk/</span>
+      </a>
+    </li>
+
+    <!-- 添加新应用：复制下面这一段，去掉前后的注释符号，改成新应用的文件夹名、名称和说明。
+    <li>
+      <a class="app" href="/文件夹名/">
+        <span class="mark" aria-hidden="true">首字母</span>
+        <span><span class="name">应用名称</span><br>
+          <span class="desc">一句话说明这个应用做什么。</span></span>
+        <span class="path">/文件夹名/</span>
+      </a>
+    </li>
+    -->
+  </ul>
+
+  <footer>个人主页：<a href="https://lijinpu.com">lijinpu.com</a></footer>
+</main>
+</body>
+</html>
