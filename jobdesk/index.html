@@ -1224,14 +1224,14 @@ function vPrefs(){
       ${lr.summary ? `<p class="hint" style="margin:4px 0 0">${esc(lr.summary)}</p>` : ""}
       ${lr.issues ? `<p class="hint" style="margin:4px 0 0;color:var(--soon)">问题：${esc(lr.issues)}</p>` : ""}
       ${lr.added ? `<button class="btn sm" type="button" data-show-new style="margin-top:8px">查看这次新增的职位</button>` : ""}
-    </div>` : `<p class="hint" style="margin:0">还没有运行记录。每日检索由 GitHub Actions 在北京时间 7:35 运行，第一次运行后这里会显示结果。</p>`;
+    </div>` : `<p class="hint" style="margin:0">还没有运行记录。每日检索由 GitHub Actions 在北京时间凌晨 4 点多运行，第一次运行后这里会显示结果。</p>`;
   return `
     <div class="view-head"><div><h1>设置</h1><p>改动自动保存，所有设备同步</p></div></div>
     <div class="prefs-grid">
       ${window.__ghPanel ? window.__ghPanel() : ""}
       <section class="panel pad">
         <h2 class="ph">每日检索</h2>
-        <p class="hint" style="margin:0 0 12px">每天北京时间 7:35 自动检索中国大陆和澳门的经济学、金融教职，新职位进入“待筛选”。下面的偏好会在下一次检索时生效。</p>
+        <p class="hint" style="margin:0 0 12px">每天北京时间凌晨 4 点多自动检索中国大陆和澳门的经济学、金融和管理科学教职，新职位进入“待筛选”。GitHub 有时会推迟运行，但不会在 DeepSeek 高峰时段（9–12 点、14–18 点）调用，费用按半价计。下面的偏好会在下一次检索时生效。</p>
         <div class="pref-fields">
           <label class="field"><span>研究领域（帮助判断哪些岗位更相关）</span><input type="text" id="pf-fields" data-pref="fields" value="${esc(pr.fields || "")}" placeholder="如：产业组织、数字经济、法经济学"></label>
           <label class="field"><span>额外关键词（每行一个）</span><textarea id="pf-keywords" data-pref="keywords" rows="3" placeholder="如：数字经济&#10;平台经济">${lines(pr.keywords)}</textarea></label>
@@ -1804,7 +1804,7 @@ function drawThumbs(){
   box.innerHTML = PARSE.images.map((f,i) => `<figure><img src="${URL.createObjectURL(f)}" alt="图片 ${i+1}"><button type="button" data-rm-img="${i}" aria-label="移除图片 ${i+1}">移除</button></figure>`).join("");
 }
 function parsePrompt(text, hasImg){
-  return `今天是 ${todayStr()}。下面是一则中国高校或研究机构的教师招聘信息${hasImg ? "（全部或部分内容在附带的图片里）" : ""}，可能来自微信公众号、学院官网或招聘网站。请提取其中适合经济学、金融学博士申请的教职岗位。
+  return `今天是 ${todayStr()}。下面是一则中国高校或研究机构的教师招聘信息${hasImg ? "（全部或部分内容在附带的图片里）" : ""}，可能来自微信公众号、学院官网或招聘网站。请提取其中适合经济学、金融学或管理科学（管理科学与工程、运筹与运营管理、决策科学）博士申请的教职岗位。
 
 规则：
 - 一则启事通常对应一个学院；同一启事里有明显不同的学院时分开列出。同一学院的多个职级合并为一条，jobType 写“多个职级”。
@@ -1905,7 +1905,7 @@ function aiContext(){
   return `进行中的职位（${act.length} 个；另有 ${closed} 个已拒或不申请）：\nid | 学校 学院 | 状态 | 截止 | 材料完成/需要 | 优先级 | 标签 | 城市\n${act.map(([id,j]) => aiJobLine(id,j)).join("\n")}\n\n未来 60 天日程：\n${evs.join("\n") || "（无）"}\n\n面试题库（未准备/有草稿/熟练）：${Object.entries(qa).map(([c,v]) => `${c} ${v.join("/")}`).join("；") || "（空）"}\n\n可用状态：${STATUSES.map(x => x.k + "=" + x.l).join("，")}；标签：${TAGS.join("、") || "（无）"}；题库分类：${QA_CATS.join("、")}`;
 }
 function aiRules(){
-  return `你是李金璞的求职助手，嵌在他的私人求职工作台里。他是经济学博士，2026–27 求职季只申请中国大陆和澳门的经济学、金融教职。现在是北京时间 ${fmtDate(todayStr())}。
+  return `你是李金璞的求职助手，嵌在他的私人求职工作台里。他是经济学博士，2026–27 求职季只申请中国大陆和澳门的经济学、金融和管理科学教职。现在是北京时间 ${fmtDate(todayStr())}。
 
 规则：
 - 用中文回答，先给结论，简洁。列表最多 8 项。
