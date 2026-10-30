@@ -239,3 +239,24 @@ export async function mnemonic(lang, v) {
 给一个简短、好记、有画面感的记忆法（谐音、拆字、字形联想、和中文或英文的联系都可以），不超过 50 个字。只输出记忆法本身，不要解释，不要加引号。`;
   return (await chat([{ role: 'user', content: prompt }], { temperature: 0.9, maxTokens: 200 })).trim();
 }
+
+// 写作批改：返回打分、改好的全文、逐句纠错和一个更地道的版本
+export async function correctWriting(lang, task, text) {
+  const M = LANGS[lang].meta;
+  const prompt = `你是耐心的${M.name}老师。一位中文母语的${M.name}初学者（水平 ${levelOf(lang)}）完成了下面的写作练习。
+题目：${task}
+学生写的：
+${text}
+
+请用中文批改，只输出 JSON：
+{
+ "score": 0到100的整数（看是否完成题目、语法和拼写是否正确；初学者写对简单句就该给高分）,
+ "praise": "一句具体的表扬",
+ "corrected": "把学生原文改正确后的全文（尽量保留原意和原来的简单表达，只改错误）",
+ "corrections": [{"you":"学生写错的那句原文","better":"改正后的句子","reading":"${lang === 'ja' ? 'better 的平假名读音' : ''}","zh":"这句的中文意思","why":"一句话说明错在哪、规则是什么"}],
+ "upgrade": "在初学者能理解的范围内，再加一两句让内容更丰富的示范（${M.name}）",
+ "upgradeZh": "upgrade 的中文"
+}
+corrections 只列真正有错的句子，最多 6 条；全部正确就给空数组。如果学生写了中文或其他语言，在 corrected 里给出对应的${M.name}，并在 why 里说明。${lang === 'ja' ? JA_RULE : ''}`;
+  return chat([{ role: 'user', content: prompt }], { json: true, temperature: 0.3, maxTokens: 1500 });
+}

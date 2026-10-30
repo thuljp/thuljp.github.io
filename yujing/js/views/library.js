@@ -13,13 +13,13 @@ function status(id) {
 }
 
 export function baseTabs(cur) {
-  const tabs = [['map', '发音全景', '#/map'], ['words', '单词', '#/library/words'], ['grammar', '语法', '#/library/grammar']];
+  const tabs = [['course', '路线', '#/course'], ['map', '发音', '#/map'], ['grammar', '知识体系', '#/library/grammar'], ['words', '单词', '#/library/words']];
   return `<div class="seg tabs" role="tablist">${tabs.map(([k, n, h]) => `<a role="tab" href="${h}" class="${k === cur ? 'on' : ''}" aria-selected="${k === cur}">${n}</a>`).join('')}</div>`;
 }
 
 export function renderLibrary(el, lang, tab = 'words') {
   const M = LANGS[lang].meta;
-  el.innerHTML = `${header('基础')}${baseTabs(tab)}
+  el.innerHTML = `${header('课程')}${baseTabs(tab)}
     <section class="lib-body"></section>`;
   const body = el.querySelector('.lib-body');
   ({ words, grammar })[tab === 'grammar' ? 'grammar' : 'words']();
@@ -72,7 +72,7 @@ export function renderLibrary(el, lang, tab = 'words') {
 export function renderGrammar(el, lang, id, from) {
   const g = grammarOf(lang).find(x => x.id === id);
   if (!g) { el.innerHTML = header('找不到这节语法', '#/library/grammar'); return; }
-  const back = from ? `#/scene/${from}/1` : '#/library/grammar';
+  const back = from ? (from.startsWith('unit-') ? `#/unit/${from.slice(5)}` : `#/scene/${from}/1`) : '#/library/grammar';
   el.innerHTML = `${header(esc(g.title), back)}
     <article class="lesson" lang="zh">${g.body}</article>
     <h2>例句</h2>
@@ -129,15 +129,26 @@ function readingView(el, lang, r) {
   el.innerHTML = `${header(tl(r.title, lang), '#/read')}
     <p class="muted">${esc(r.titleZh)}</p>
     <div class="toolbar"><button class="btn primary" id="all">${ICON.play}从头朗读</button>
-      <label class="check"><input type="checkbox" id="zh"> 显示中文</label></div>
+      <label class="check"><input type="checkbox" id="zh"> 显示中文</label>
+      <label class="check"><input type="checkbox" id="lo"> 只听不看</label></div>
+    <p class="hint lo-hint" hidden>先闭上眼睛听两遍，能听懂几成？再点句子揭开文字核对。</p>
     <div class="story hide-zh">${r.sentences.map((s, i) => `<p class="sent" data-i="${i}">${tl(s.t, lang)}${ja && s.r ? readingLine(s.r, romaji(s.r), lang) : ''}<span class="zh">${esc(s.zh || '')}</span></p>`).join('')}</div>
     ${r.newWords?.length ? `<h2>新词</h2><ul class="newwords">${r.newWords.map(w => `<li>${playBtn(ja ? (w[1] || w[0]) : w[0], lang)}${tl(w[0], lang)}${ja && w[1] ? `<span class="w-read">${esc(w[1])}</span>` : ''}<span>${esc(ja ? w[2] : w[1])}</span></li>`).join('')}</ul>` : ''}
     ${r.questions?.length ? `<h2>读懂了吗？</h2><ol class="qs">${r.questions.map(q => `<li><p>${esc(q.q)}</p><details><summary>看答案</summary><p>${esc(q.a)}</p></details></li>`).join('')}</ol>` : ''}
     <p class="muted">点任意一句可单独朗读。</p>`;
   const story = el.querySelector('.story');
   el.querySelector('#zh').onchange = e => story.classList.toggle('hide-zh', !e.target.checked);
+  el.querySelector('#lo').onchange = e => {
+    story.classList.toggle('listen-only', e.target.checked);
+    story.querySelectorAll('.sent').forEach(p => p.classList.remove('peek'));
+    el.querySelector('.lo-hint').hidden = !e.target.checked;
+  };
   const say = i => { story.querySelectorAll('.sent').forEach(p => p.classList.toggle('now', +p.dataset.i === i)); return speak(r.sentences[i].t, lang); };
-  story.onclick = e => { const p = e.target.closest('.sent'); if (p) { playing = false; say(+p.dataset.i); } };
+  story.onclick = e => {
+    const p = e.target.closest('.sent'); if (!p) return;
+    if (story.classList.contains('listen-only') && !p.classList.contains('peek')) { p.classList.add('peek'); return; }
+    playing = false; say(+p.dataset.i);
+  };
   el.querySelector('#all').onclick = async e => {
     const b = e.currentTarget;
     if (playing) { playing = false; stop(); b.innerHTML = ICON.play + '从头朗读'; return; }

@@ -1,4 +1,4 @@
-import { S, save, LANGS, counts, scenesOf, sceneState, studiedOn, todayTotal as todayRec, stats, onChange, nextUnit, foundProgress, foundReady, UNITS } from './store.js';
+import { S, save, LANGS, counts, scenesOf, sceneState, studiedOn, todayTotal as todayRec, stats, onChange, nextUnit, foundProgress, foundReady, UNITS, COURSE, nextStep, courseProgress, practicePool } from './store.js';
 import { aiReady } from './ai.js';
 import { stop } from './speech.js';
 import { startReminderLoop } from './reminder.js';
@@ -11,13 +11,16 @@ import { renderLibrary, renderGrammar, renderRead } from './views/library.js';
 import { renderProgress } from './views/progress.js';
 import { renderSettings } from './views/settings.js';
 import { renderMap, renderLesson } from './views/learn.js';
+import { renderCourse, renderUnit, renderKnowledge } from './views/course.js';
+import { renderPractice } from './views/practice.js';
 
 const view = document.getElementById('view');
 const nav = document.getElementById('nav');
 const langSwitch = document.getElementById('lang-switch');
 bindSay(view);
 
-const NAV = [['today', '今天', ICON.today], ['scenes', '场景', ICON.scenes], ['map', '基础', ICON.library], ['progress', '进度', ICON.progress], ['settings', '设置', ICON.settings]];
+const NAV = [['today', '今天', ICON.today], ['course', '课程', ICON.library], ['practice', '练习', ICON.practice], ['progress', '进度', ICON.progress], ['settings', '设置', ICON.settings]];
+const NAV_OF = { scene: 'practice', scenes: 'practice', read: 'practice', unit: 'course', map: 'course', lesson: 'course', library: 'course', grammar: 'course', review: 'today' };
 nav.innerHTML = NAV.map(([k, n, i]) => `<a href="#/${k}" data-nav="${k}">${i}<span>${n}</span></a>`).join('');
 
 function drawLangSwitch() {
@@ -31,7 +34,7 @@ langSwitch.onclick = e => {
   S().lang = b.dataset.l; save(); drawLangSwitch();
   // 场景详情等页面属于某一门语言，切换后回到对应列表
   const h = location.hash;
-  if (/^#\/(scene|grammar|read|lesson)\//.test(h)) location.hash = h.startsWith('#/scene/') ? '#/scenes' : h.startsWith('#/grammar/') ? '#/library/grammar' : h.startsWith('#/lesson/') ? '#/map' : '#/read';
+  if (/^#\/(scene|grammar|read|lesson|unit)\//.test(h) || h.startsWith('#/practice/write?')) location.hash = h.startsWith('#/scene/') ? '#/scenes' : h.startsWith('#/grammar/') ? '#/library/grammar' : h.startsWith('#/lesson/') ? '#/map' : h.startsWith('#/unit/') ? '#/course' : h.startsWith('#/practice') ? '#/practice/write' : '#/read';
   else route();
 };
 
@@ -48,8 +51,9 @@ function route() {
   const parts = path.split('/');
   const lang = st.lang;
   drawLangSwitch();
-  nav.querySelectorAll('a').forEach(a => a.classList.toggle('on', a.dataset.nav === parts[0] || (parts[0] === 'scene' && a.dataset.nav === 'scenes') || (['grammar', 'library', 'lesson'].includes(parts[0]) && a.dataset.nav === 'map') || ((parts[0] === 'review' || parts[0] === 'read') && a.dataset.nav === 'today')));
-  document.body.classList.toggle('focus-mode', ['review', 'welcome', 'lesson'].includes(parts[0]));
+  const navKey = NAV_OF[parts[0]] || parts[0];
+  nav.querySelectorAll('a').forEach(a => a.classList.toggle('on', a.dataset.nav === navKey));
+  document.body.classList.toggle('focus-mode', ['review', 'welcome', 'lesson', 'unit'].includes(parts[0]) || (parts[0] === 'practice' && ['dictation', 'speak'].includes(parts[1])));
   view.scrollTop = 0; window.scrollTo(0, 0);
   const from = new URLSearchParams(query || '').get('from');
   switch (parts[0]) {
@@ -59,7 +63,10 @@ function route() {
     case 'scene': return renderScene(view, lang, parts[1], parts[2]);
     case 'map': return renderMap(view, lang, parts[1]);
     case 'lesson': return renderLesson(view, lang, parts[1]);
-    case 'library': return parts[1] === 'sounds' ? renderMap(view, lang) : renderLibrary(view, lang, parts[1] || 'words');
+    case 'course': return renderCourse(view, lang);
+    case 'unit': return renderUnit(view, lang, parts[1]);
+    case 'practice': return renderPractice(view, lang, parts[1], new URLSearchParams(query || ''));
+    case 'library': return parts[1] === 'sounds' ? renderMap(view, lang) : parts[1] === 'grammar' ? renderKnowledge(view, lang) : renderLibrary(view, lang, parts[1] || 'words');
     case 'grammar': return renderGrammar(view, lang, parts[1], from);
     case 'read': return renderRead(view, lang, parts[1]);
     case 'progress': return renderProgress(view, lang);
@@ -84,8 +91,22 @@ function renderToday(el, lang) {
   const sceneDoneToday = !!doneTodayScene;
   const reviewDone = c.due === 0 && c.fresh === 0;
   const nu = nextUnit(lang), fp = foundProgress(lang), ready = foundReady(lang);
-  const nuNo = nu ? UNITS[lang].indexOf(nu) + 1 : 0;
-  const lessonToday = UNITS[lang].some(u => { const x = st.found[lang + '|' + u.id]; return x?.at && !x.skipped && dayKey(x.at) === dayKey(); });
+  const step = nextStep(lang), cp = courseProgress(lang);
+  const lessonToday = [...UNITS[lang], ...COURSE[lang]].some(u => { const x = st.found[lang + '|' + u.id]; return x?.at && !x.skipped && dayKey(x.at) === dayKey(); });
+  let stepCard = '';
+  if (step) {
+    const isC = step.kind === 'course', u = step.unit;
+    const no = (isC ? COURSE[lang] : UNITS[lang]).indexOf(u) + 1;
+    const href = isC ? '#/unit/' + u.id : '#/lesson/' + u.id;
+    stepCard = `<li class="${lessonToday ? 'done' : ''}">
+        <div class="plan-main"><h2>${isC ? '核心课程' : '发音入门'}</h2>
+          <p>${lessonToday ? `今天已学完一课。想多学，下一课是${isC ? ` ${u.emoji} ` : ''}第 ${no} 课 ${esc(u.title)}` : `${isC ? u.emoji + ' ' : ''}第 ${no} 课 · <span ${isC && lang === 'ja' ? 'lang="ja"' : ''}>${esc(u.title)}</span> <span class="muted">${esc(u.sub)}</span>`}</p>
+          <p class="muted">${isC ? `${esc(u.can)} · ${cp.done}/${cp.total} · 约 15 分钟` : `入门 ${fp.done}/${fp.total} · 约 6 分钟`} · <a href="#/course">看课程路线</a></p></div>
+        <a class="btn ${lessonToday ? '' : 'primary'}" href="${href}">${lessonToday ? '再学一课' : '开始'}</a>
+      </li>`;
+  }
+  const PR = [['dictation', '听写', '听一句写一句，8 句约 6 分钟', '#/practice/dictation'], ['speak', '跟读', '听原声跟着说，语音识别打分', '#/practice/speak'], ['write', '写作', aiReady() ? '按课程题目写几句，AI 批改' : '按课程题目写几句，对照范文', '#/practice/write'], ['read', '阅读', aiReady() ? '用你会的词写成的小故事，可以只听不看' : '接入 AI 后每天一篇定制短文', aiReady() ? '#/read' : '#/settings']];
+  const pr = PR[(Number(dayKey().slice(-2)) + (cp.done ? 0 : 1)) % PR.length];
 
   // 本周
   const k = dayKey();
@@ -105,29 +126,24 @@ function renderToday(el, lang) {
     </section>
 
     <ol class="plan">
-      ${nu ? `<li class="${lessonToday ? 'done' : ''}">
-        <div class="plan-main"><h2>入门课</h2>
-          <p>${lessonToday ? `今天已学完一课。想多学，下一课是第 ${nuNo} 课 ${esc(nu.title)}` : `第 ${nuNo} 课 · ${esc(nu.title)} <span class="muted">${esc(nu.sub)}</span>`}</p>
-          <p class="muted">入门 ${fp.done}/${fp.total} · 约 6 分钟 · <a href="#/map">看发音全景</a></p></div>
-        <a class="btn ${lessonToday ? '' : 'primary'}" href="#/lesson/${nu.id}">${lessonToday ? '再学一课' : '开始'}</a>
-      </li>` : ''}
+      ${stepCard}
       <li class="${reviewDone ? 'done' : ''}">
         <div class="plan-main"><h2>复习${ready ? '与新词' : ''}</h2>
           <p>${reviewDone ? (nu && !s.sounds ? '学完第一课，学过的内容会出现在这里。' : '今天的卡片都完成了。') : `<b>${c.due}</b> 张到期${c.fresh ? ` · <b>${c.fresh}</b> 个新条目` : ''}`}</p>
           <p class="muted">${ready ? '约 10–15 分钟。先回忆，再看答案。' : `学完前 ${lang === 'ja' ? 8 : 5} 课（基础发音）后，每天开始学新词。`}</p></div>
-        ${reviewDone ? '<span class="tick" aria-label="已完成">✓</span>' : `<a class="btn ${nu && !lessonToday ? '' : 'primary'}" href="#/review">开始</a>`}
+        ${reviewDone ? '<span class="tick" aria-label="已完成">✓</span>' : `<a class="btn ${step && !lessonToday ? '' : 'primary'}" href="#/review">开始</a>`}
       </li>
       <li class="${sceneDoneToday ? 'done' : ''}">
         <div class="plan-main"><h2>今日场景</h2>
           ${sceneDoneToday ? `<p>${doneTodayScene.emoji} ${esc(doneTodayScene.title)} ${tl(doneTodayScene.place, lang, 'muted')}</p>
           <p class="muted">今天已完成${nextScene ? `。想多练的话，下一个是${esc(nextScene.title)}：<a href="#/scene/${nextScene.id}">开始</a>` : ''}</p>` : nextScene ? `<p>${nextScene.emoji} ${esc(nextScene.title)} ${tl(nextScene.place, lang, 'muted')}</p>
           <p class="muted">${ns.step ? `进行到第 ${Math.min(ns.step + 1, 5)} 步 · ` : ''}${esc(nextScene.cando)}${!ready && !ns.step ? '<br>建议先学几节入门课；先听听、跟读也可以。' : ''}</p>` : '<p>内置场景都完成了。让 AI 按你的需要生成新的吧。</p>'}</div>
-        ${sceneDoneToday ? '<span class="tick" aria-label="已完成">✓</span>' : `<a class="btn ${reviewDone && !nu ? 'primary' : ''}" href="${nextScene ? '#/scene/' + nextScene.id : '#/scenes'}">${ns?.step ? '继续' : '开始'}</a>`}
+        ${sceneDoneToday ? '<span class="tick" aria-label="已完成">✓</span>' : `<a class="btn ${reviewDone && !step ? 'primary' : ''}" href="${nextScene ? '#/scene/' + nextScene.id : '#/scenes'}">${ns?.step ? '继续' : '开始'}</a>`}
       </li>
       <li>
-        <div class="plan-main"><h2>阅读一篇小故事</h2>
-          <p class="muted">${aiReady() ? '用你会的词写成，只夹几个新词。' : '接入 AI 后，每天生成一篇按你词汇量定制的短文。'}</p></div>
-        <a class="btn ghost" href="${aiReady() ? '#/read' : '#/settings'}">${aiReady() ? '去读' : '去设置'}</a>
+        <div class="plan-main"><h2>今日练习：${pr[1]}</h2>
+          <p class="muted">${pr[2]}。<a href="#/practice">其他练习</a></p></div>
+        <a class="btn ghost" href="${pr[3]}">去练</a>
       </li>
     </ol>
 
@@ -139,9 +155,10 @@ function renderToday(el, lang) {
 
     ${!ready ? `<section class="panel method">
       <h2>零基础怎么开始</h2>
-      <p>先打地基：每天 1–2 节入门课，${lang === 'ja' ? '大约两周把平假名、片假名和发音规则过一遍' : '大约一周把法语的所有发音和拼读规则过一遍'}。每节课先看全貌、再逐个认识、再练到答对。</p>
-      <p>学过的内容会在你快要忘的时候出现在<b>复习</b>里。基础打好以后，每天开始学新词，并用<b>场景</b>把它们用起来。</p>
-      <a class="btn ghost" href="#/map">看${lang === 'ja' ? '五十音' : '法语发音'}全景</a>
+      <p><b>① 发音入门</b>：每天 1–2 节，${lang === 'ja' ? '大约两周把平假名、片假名和发音规则过一遍' : '大约一周把法语的所有发音和拼读规则过一遍'}。</p>
+      <p><b>② 核心课程</b>：12 课，每课一个真实情景，系统学完 A1 的核心语法和高频词。</p>
+      <p><b>③ 进阶练习</b>：听写、跟读、写作、场景对话、阅读，把学过的东西反复用起来。学过的内容会在快要忘的时候出现在<b>复习</b>里。</p>
+      <a class="btn ghost" href="#/course">看课程路线</a>
     </section>` : ''}
 
     ${other.length ? `<p class="other-lang">${other.map(l => { const oc = counts(l); return `<button class="link-btn" data-sw="${l}">${LANGS[l].meta.flag} ${LANGS[l].meta.name}：${oc.due} 张到期，${oc.fresh} 个新条目</button>`; }).join('')}</p>` : ''}
@@ -252,7 +269,7 @@ onSyncStatus(s => {
 });
 startSync(() => {
   const page = (location.hash.slice(2) || 'today').split(/[/?]/)[0];
-  if (['today', 'scenes', 'library', 'progress', 'welcome'].includes(page)) {
+  if (['today', 'scenes', 'library', 'progress', 'welcome', 'course', 'map'].includes(page) && !/^#\/practice\//.test(location.hash)) {
     if (page === 'welcome' && S().onboarded) location.hash = '#/today'; else route();
   }
 });

@@ -28,7 +28,7 @@ export function renderMap(el, lang, tab) {
   const M = LANGS[lang].meta;
   const p = foundProgress(lang);
   const nu = nextUnit(lang);
-  el.innerHTML = `${header('基础')}${baseTabs('map')}
+  el.innerHTML = `${header('课程')}${baseTabs('map')}
     <p class="lede">${lang === 'ja'
       ? '日语的全部发音都在这张表里：5 个元音 × 十几个辅音行。按行学，一行就是一课；每个假名都来自一个汉字，这是你作为中文母语者的捷径。'
       : '法语的全部发音都在这里。元音按"舌头前后 × 嘴巴开合 × 嘴唇圆不圆"排列，辅音按"清 / 浊"成对排列。看懂这张图，就知道每个新音"在哪儿"。'}</p>
@@ -390,8 +390,8 @@ export function renderLesson(el, lang, unitId) {
         ${unit.contrast ? '' : `<div class="lit ${lang === 'ja' ? 'ja' : ''}">${learned.map((x, i) => `<span style="--d:${i * 40}ms" ${lang === 'ja' ? 'lang="ja"' : ''}>${esc(lang === 'ja' ? x.k : x.type === 'p' ? '/' + x.ipa + '/' : x.title)}</span>`).join('')}</div>`}
         <ul class="done-stats"><li>首次答对 <b>${results.score}%</b></li></ul>
         <p class="done-note">${unit.contrast ? '这一课没有卡片，但之后读到长音、促音时你会自然注意到拍子。' : '它们会在 10 分钟后、明天、几天后再出现在复习里。在快要忘的时候想起来一次，记得最牢。'}</p>
-        ${unlockedWords ? '<p class="ok-text">基础打好了：从今天起，每天会开始学新词。</p>' : ''}
-        <div class="row">${n ? `<a class="btn primary" href="#/lesson/${n.id}">下一课：${esc(n.title)}</a>` : ''}<a class="btn ghost" href="#/map${lang === 'ja' && unit.set === '片假名' ? '/kata' : ''}">回全景</a><a class="btn ghost" href="#/review">去复习</a></div>
+        ${unlockedWords ? '<p class="ok-text">基础打好了：可以开始核心课程第 1 课，每天的复习里也会开始出现新词。</p>' : ''}
+        <div class="row">${unlockedWords ? '<a class="btn primary" href="#/unit/c1">开始核心课程</a>' : ''}${n ? `<a class="btn ${unlockedWords ? 'ghost' : 'primary'}" href="#/lesson/${n.id}">下一课：${esc(n.title)}</a>` : ''}<a class="btn ghost" href="#/map${lang === 'ja' && unit.set === '片假名' ? '/kata' : ''}">回全景</a><a class="btn ghost" href="#/review">去复习</a></div>
       </section>`;
     keys = null;
   }

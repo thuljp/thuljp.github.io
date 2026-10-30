@@ -174,7 +174,7 @@ let keyHandler = null;
 document.addEventListener('keydown', e => { if (keyHandler && location.hash.startsWith('#/review')) keyHandler(e); });
 
 function kindLabel(v, isNew) {
-  const k = v.kind === 'w' ? '单词' : v.kind === 's' ? (v.lang === 'ja' ? v.set : v.phoneme ? '发音' : '拼读规则') : v.kind === 'c' ? `语块 · ${esc(v.scene)}` : '纠错';
+  const k = v.kind === 'w' ? '单词' : v.kind === 's' ? (v.lang === 'ja' ? v.set : v.phoneme ? '发音' : '拼读规则') : v.kind === 'c' ? `语块 · ${esc(v.scene)}` : v.kind === 'u' ? `课文 · ${esc(v.scene)}` : `纠错${v.scene && v.scene !== '复盘纠错' ? ' · ' + esc(v.scene) : ''}`;
   return `${isNew ? '<span class="tag new">新</span>' : ''}<span>${k}</span>${v.prod ? '<span class="tag">说出来</span>' : ''}`;
 }
 

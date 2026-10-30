@@ -1,10 +1,14 @@
 import * as FR from './data/fr.js';
 import * as JA from './data/ja.js';
 import * as FD from './data/found.js';
+import * as CF from './data/course_fr.js';
+import * as CJ from './data/course_ja.js';
 import { newCard, schedule, isMature, isLearned, DAY } from './fsrs.js';
 import { dayKey, endOfDay, romaji, uid } from './util.js';
 
 export const LANGS = { fr: FR, ja: JA };
+export const COURSE_DATA = { fr: CF, ja: CJ };
+export const COURSE = { fr: CF.units, ja: CJ.units };
 const KEY = 'yujing.v1';
 
 // 每台设备一个固定 id：每日统计按设备分开记，多设备同步时相加而不是互相覆盖
@@ -118,8 +122,12 @@ export function addSpeak(sec) { if (sec > 0) { today().speakSec += sec; save(); 
 // ---------- 内容 ----------
 export function scenesOf(lang) { return [...LANGS[lang].scenes, ...state.custom[lang].scenes]; }
 export function findScene(lang, id) { return scenesOf(lang).find(s => s.id === id); }
-export function wordsOf(lang) { return [...LANGS[lang].words, ...state.custom[lang].words]; }
-export function grammarOf(lang) { return LANGS[lang].grammar; }
+const courseWords = {}, grammarAll = {};
+export function wordsOf(lang) {
+  courseWords[lang] ||= COURSE[lang].flatMap(u => u.newWords);
+  return [...LANGS[lang].words, ...courseWords[lang], ...state.custom[lang].words];
+}
+export function grammarOf(lang) { return (grammarAll[lang] ||= [...LANGS[lang].grammar, ...COURSE_DATA[lang].grammar]); }
 // 发音条目：日语 = 假名（带字源和例词）；法语 = 音素 + 拼读规则
 let soundCache = {};
 export function soundsOf(lang) {
@@ -180,6 +188,15 @@ export function cardView(id) {
     const ja = lang === 'ja';
     return { id, lang, kind, prod: true, prompt: ja ? c[2] : c[1], front: c[0], reading: ja ? c[1] : '', romaji: ja ? romaji(c[1]) : '', speak: c[0], scene: sc.title };
   }
+  if (kind === 'u') {
+    // 课文句：产出卡
+    const [uid_, idx] = ref.split('#');
+    const u = COURSE[lang].find(x => x.id === uid_);
+    const st = u?.sentences[+idx];
+    if (!st) return null;
+    const ja = lang === 'ja';
+    return { id, lang, kind, prod: true, prompt: ja ? st[2] : st[1], front: st[0], reading: ja ? st[1] : '', romaji: ja ? romaji(st[1]) : '', speak: st[0], scene: '第' + u.id.slice(1) + '课 · ' + u.title };
+  }
   if (kind === 'x') {
     const card = state.cards[id];
     const d = card?.data;
@@ -226,9 +243,12 @@ function newCandidates(lang, kind) {
   if (kind === 's') return soundsOf(lang).map(s => `${lang}|s|${s.id}`).filter(id => state.cards[id]?.state === 'new' && state.cards[id].lesson);
   // 单词：先学当前/已学场景相关词，再按词表顺序
   const doneScenes = new Set(Object.entries(state.scenes).filter(([k, v]) => k.startsWith(lang + '|') && v.step > 0).map(([k]) => k.split('|')[1]));
-  const list = wordsOf(lang).map((w, i) => ({ id: `${lang}|w|${wordId(w)}`, tag: lang === 'fr' ? w[5] : w[6], i }));
-  const pri = x => (doneScenes.has(x.tag) ? 0 : x.tag === 'core' ? 1 : x.tag === 'num' ? 2 : 3) * 10000 + x.i;
-  return list.filter(x => !state.cards[x.id] || state.cards[x.id].state === 'new').sort((a, b) => pri(a) - pri(b)).map(x => x.id);
+  // 课程：学完的课里的词最优先；课程专属的新词等学到那一课再出现
+  const cw = courseWordUnits(lang);
+  const doneUnit = key => cw[key] && courseState(lang, cw[key]).done;
+  const list = wordsOf(lang).map((w, i) => ({ id: `${lang}|w|${wordId(w)}`, key: wordId(w), tag: lang === 'fr' ? w[5] : w[6], i }));
+  const pri = x => (doneUnit(x.key) ? 0 : doneScenes.has(x.tag) ? 1 : x.tag === 'core' ? 2 : x.tag === 'num' ? 3 : 4) * 10000 + x.i;
+  return list.filter(x => (!state.cards[x.id] || state.cards[x.id].state === 'new') && (x.tag !== 'course' || doneUnit(x.key))).sort((a, b) => pri(a) - pri(b)).map(x => x.id);
 }
 
 export function queueFor(lang, { extraNew = 0 } = {}) {
@@ -248,7 +268,7 @@ export function queueFor(lang, { extraNew = 0 } = {}) {
   const newW = foundReady(lang) ? newCandidates(lang, 'w').slice(0, wLeft) : [];
   const newS = newCandidates(lang, 's').slice(0, sLeft);
   // 场景语块与纠错卡（state=new，已加入卡库）优先于普通新词
-  const pending = Object.entries(state.cards).filter(([id, c]) => id.startsWith(lang + '|') && c.state === 'new' && (id.includes('|c|') || id.includes('|x|'))).map(([id]) => id);
+  const pending = Object.entries(state.cards).filter(([id, c]) => id.startsWith(lang + '|') && c.state === 'new' && (id.includes('|c|') || id.includes('|x|') || id.includes('|u|'))).map(([id]) => id);
   return { due, learning, newCards: [...newS, ...pending, ...newW] };
 }
 
@@ -318,6 +338,74 @@ export function skipUnits(lang, ids) {
   save();
 }
 export function resetUnit(lang, id) { delete state.found[lang + '|' + id]; save(); }
+
+// ---------- 核心课程 ----------
+// 进度和入门课一样存在 found 里（键 'fr|c3'），所以多设备同步不用改
+const cwCache = {};
+export function courseWordUnits(lang) {   // 词 → 第一次出现的课
+  if (cwCache[lang]) return cwCache[lang];
+  const m = {};
+  for (const u of COURSE[lang]) for (const k of [...u.words, ...u.newWords.map(w => w[0])]) m[k] ||= u.id;
+  return (cwCache[lang] = m);
+}
+export const courseUnit = (lang, id) => COURSE[lang].find(u => u.id === id);
+export const courseState = (lang, id) => state.found[lang + '|' + id] || { done: false };
+export const nextCourse = lang => COURSE[lang].find(u => !courseState(lang, u.id).done) || null;
+export function courseProgress(lang) {
+  const us = COURSE[lang];
+  return { done: us.filter(u => courseState(lang, u.id).done).length, total: us.length };
+}
+export function unitWords(lang, unit) {
+  const all = wordsOf(lang);
+  return [...unit.words, ...unit.newWords.map(w => w[0])].map(k => all.find(w => w[0] === k)).filter(Boolean);
+}
+// 学过的语法点：出现在已完成的课里
+export function grammarLearned(lang) {
+  const out = {};
+  for (const u of COURSE[lang]) {
+    const done = courseState(lang, u.id).done;
+    for (const g of u.grammar) { out[g] ||= { unit: u.id, done: false }; if (done) out[g].done = true; }
+  }
+  return out;
+}
+// 现在该学什么：发音入门（到能学单词为止）→ 核心课程 → 剩下的发音课
+export function nextStep(lang) {
+  const nu = nextUnit(lang);
+  if (!foundReady(lang) && nu) return { kind: 'found', unit: nu };
+  const nc = nextCourse(lang);
+  if (nc) return { kind: 'course', unit: nc };
+  if (nu) return { kind: 'found', unit: nu };
+  return null;
+}
+// 完成一课：配对游戏里的词进入复习（配错过的间隔更短），课文句子作为"开口说"卡加入卡库
+export function completeCourse(lang, unit, results) {
+  const k = lang + '|' + unit.id, prev = state.found[k] || {};
+  const first = !prev.done;
+  state.found[k] = { done: true, at: prev.at || Date.now(), best: Math.max(prev.best || 0, results.score || 0) };
+  let words = 0;
+  for (const w of unitWords(lang, unit)) {
+    const id = `${lang}|w|${w[0]}`;
+    const c = ensureCard(id);
+    if (c.state !== 'new') continue;
+    const r = results.words?.[w[0]];
+    if (r) { rate(id, r.wrong ? 2 : 3); words++; }
+  }
+  let sents = 0;
+  unit.sentences.forEach((_, i) => { const id = `${lang}|u|${unit.id}#${i}`; if (!state.cards[id]) { ensureCard(id); sents++; } });
+  if (first) state.stamps.push({ lang, sceneId: 'course-' + unit.id, text: unit.can, title: '第' + unit.id.slice(1) + '课 ' + unit.title, emoji: unit.emoji, date: dayKey() });
+  save();
+  return { first, words, sents };
+}
+// 练习素材：已完成课程的句子（一课都没学时用第 1 课）
+export function practicePool(lang) {
+  const done = COURSE[lang].filter(u => courseState(lang, u.id).done);
+  const units = done.length ? done : COURSE[lang].slice(0, 1);
+  const ja = lang === 'ja';
+  return units.flatMap(u => [
+    ...u.sentences.map(s => ({ t: s[0], r: ja ? s[1] : '', zh: ja ? s[2] : s[1], unit: u.id })),
+    ...u.dialogue.map(d => ({ t: d[1], r: ja ? d[2] : '', zh: ja ? d[3] : d[2], unit: u.id })),
+  ]);
+}
 
 // ---------- 联想笔记 ----------
 export const noteOf = id => state.notes[id];
