@@ -1,4 +1,4 @@
-import { S, stats, forecast, studiedOn, LANGS, addSpeak, allDays } from '../store.js';
+import { S, stats, forecast, studiedOn, LANGS, addSpeak, allDays, foundProgress } from '../store.js';
 import { startRecording, saveDiary, listDiary, deleteDiary } from '../speech.js';
 import { esc, dayKey, addDays, uid, toast } from '../util.js';
 import { header, ICON, fmtMin } from '../ui.js';
@@ -46,7 +46,7 @@ export function renderProgress(el, lang) {
 
     <section class="stat-grid">
       <div><b>${s.words}</b><span>学过的词</span><small>${s.wordsMature} 个已牢固（间隔 ≥ 21 天）</small></div>
-      <div><b>${s.sounds}<i>/${s.soundTotal}</i></b><span>${M.soundLabel}</span><small>${lang === 'ja' ? '平假名 + 片假名' : '拼读规则'}</small></div>
+      <div><b>${s.sounds}<i>/${s.soundTotal}</i></b><span>${M.soundLabel}</span><small>入门课 ${foundProgress(lang).done}/${foundProgress(lang).total} · <a href="#/map">全景</a></small></div>
       <div><b>${s.chunks}</b><span>会说的语块</span><small>来自场景和复盘纠错</small></div>
       <div><b>${fmtMin(totalIn)}</b><span>可理解输入</span><small>开口 ${fmtMin(totalSpeak)}</small></div>
     </section>

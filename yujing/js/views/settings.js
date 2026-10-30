@@ -24,7 +24,7 @@ export function renderSettings(el) {
     ${langs.map(l => `<div class="field-row">
       <span class="label">${LANGS[l].meta.name}</span>
       <label>每天新词 <input type="number" min="0" max="50" data-nw="${l}" value="${set.newWords[l]}"></label>
-      <label>每天新${LANGS[l].meta.soundLabel} <input type="number" min="0" max="30" data-ns="${l}" value="${set.newSounds[l]}"></label></div>`).join('')}
+      <label>课后待复习的新${LANGS[l].meta.soundLabel}（每天） <input type="number" min="0" max="30" data-ns="${l}" value="${set.newSounds[l]}"></label></div>`).join('')}
     <p class="hint">新词学进来之后要按间隔反复复习。粗略经验：坚持一段时间后，每天的复习量大约是每日新词数的 4–6 倍（每天 10 个新词 ≈ 每天 40–60 张复习，10–15 分钟）。复习积压时先减新词。</p>
     <div class="field-row"><label>每周目标 <input type="number" min="1" max="7" id="wg" value="${set.weeklyGoal}"> 天</label></div>
   </section>

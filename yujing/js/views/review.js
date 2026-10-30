@@ -1,7 +1,9 @@
-import { S, queueFor, cardView, ensureCard, rate, LANGS } from '../store.js';
+import { S, queueFor, cardView, ensureCard, rate, LANGS, noteOf, setNote } from '../store.js';
+import { aiReady, mnemonic } from '../ai.js';
+import { originHTML, exampleHTML, highlightFr } from './learn.js';
 import { preview, MIN } from '../fsrs.js';
 import { speak, stop, listen, sttAvailable } from '../speech.js';
-import { esc, similarity } from '../util.js';
+import { esc, similarity, toast } from '../util.js';
 import { tl, readingLine, ICON, header } from '../ui.js';
 
 // 一次复习会话：到期卡 + 新卡穿插；当天学习步骤的卡片在会话内回炉
@@ -69,12 +71,13 @@ export function renderReview(el, lang) {
       <article class="flash ${v.prod ? 'prod' : ''} ${isNew ? 'is-new' : ''}">
         <div class="flash-kind">${kindLabel(v, isNew)}</div>
         <div class="flash-front">${front(v)}</div>
-        <div class="flash-back" hidden>${back(v)}</div>
+        <div class="flash-back" hidden>${back(v)}${memoBox(v, card)}</div>
       </article>
       <div class="flash-actions"></div>`;
 
     const actions = el.querySelector('.flash-actions');
     const backEl = el.querySelector('.flash-back');
+    bindMemo(el, v, card);
 
     const reveal = () => {
       backEl.hidden = false;
@@ -171,15 +174,16 @@ let keyHandler = null;
 document.addEventListener('keydown', e => { if (keyHandler && location.hash.startsWith('#/review')) keyHandler(e); });
 
 function kindLabel(v, isNew) {
-  const k = v.kind === 'w' ? '单词' : v.kind === 's' ? (v.lang === 'ja' ? v.set : '发音规则') : v.kind === 'c' ? `语块 · ${esc(v.scene)}` : '纠错';
+  const k = v.kind === 'w' ? '单词' : v.kind === 's' ? (v.lang === 'ja' ? v.set : v.phoneme ? '发音' : '拼读规则') : v.kind === 'c' ? `语块 · ${esc(v.scene)}` : '纠错';
   return `${isNew ? '<span class="tag new">新</span>' : ''}<span>${k}</span>${v.prod ? '<span class="tag">说出来</span>' : ''}`;
 }
 
 function front(v) {
   const L = v.lang;
   if (v.prod) return `<p class="prompt">${esc(v.prompt)}</p><p class="sub">用${LANGS[L].meta.name}怎么说？</p>`;
-  if (v.big) return `<div class="kana-big" lang="ja">${esc(v.front)}</div>`;
-  if (v.sound) return `<div class="pattern">${tl(v.front, L)}</div><p class="sub">${tl(v.ex, L)}</p>`;
+  if (v.big) return `<div class="kana-big" lang="ja">${esc(v.front)}</div><p class="sub">读什么？</p>`;
+  if (v.phoneme) return `<div class="pattern ipa">${esc(v.front)}</div><p class="sub">拼写：<span lang="fr">${v.item.spell.map(s => esc(s[0])).join(' · ')}</span></p><p class="sub">这个音怎么发？先在心里发一遍，再看答案</p>`;
+  if (v.rule) return `<p class="prompt">${esc(v.front)}</p><p class="sub">拼读规则</p>`;
   return `<div class="word">${tl(v.front, L)} <button class="icon-btn play" data-say="${esc(v.speak)}" data-lang="${L}" aria-label="播放">${ICON.play}</button></div>`;
 }
 
@@ -187,9 +191,55 @@ function back(v) {
   const L = v.lang;
   if (v.prod) return `<div class="answer">${tl(v.front, L)} <button class="icon-btn play" data-say="${esc(v.speak)}" data-lang="${L}" aria-label="播放">${ICON.play}</button></div>
     ${readingLine(v.reading, v.romaji, L)}${v.note ? `<p class="note">${esc(v.note)}</p>` : ''}`;
-  if (v.big) return `<p class="romaji-big">${esc(v.meaning)}</p>${v.tip ? `<p class="note">${esc(v.tip)}</p>` : ''}`;
-  if (v.sound) return `<p class="ipa">${esc(v.reading)}</p><p class="meaning">${esc(v.meaning)}</p><button class="btn small ghost" data-say="${esc(v.speak)}" data-lang="${L}">${ICON.play}听例词</button>`;
+  if (v.big) return `<p class="romaji-big">${esc(v.meaning)}</p>${originHTML(v.item)}${exampleHTML(v.item)}${v.tip ? `<p class="note">${esc(v.tip)}</p>` : ''}`;
+  if (v.phoneme) {
+    const it = v.item;
+    return `<p class="meaning">${esc(it.anchor)}</p>${it.mouth ? `<p class="note">${esc(it.mouth)}</p>` : ''}
+      <div class="chips center">${it.spell.map(([g, w]) => `<button class="chip" data-say="${esc(w)}" data-lang="fr"><b lang="fr">${esc(g)}</b><span lang="fr">${highlightFr(w, g)}</span></button>`).join('')}</div>`;
+  }
+  if (v.rule) return `<p class="meaning">${esc(v.item.title)}</p><p class="note">${esc(v.item.body)}</p>
+      <div class="chips center">${v.item.ex.map(w => `<button class="chip" data-say="${esc(w)}" data-lang="fr">${ICON.play}<span lang="fr">${esc(w)}</span></button>`).join('')}</div>`;
   return `${L === 'fr' ? `<p class="ipa">${esc(v.reading)}</p>` : readingLine(v.reading, v.romaji, L)}
     <p class="meaning">${esc(v.meaning)}</p>
     ${v.ex ? `<div class="example"><button class="icon-btn play small" data-say="${esc(v.speakEx)}" data-lang="${L}" aria-label="播放例句">${ICON.play}</button><div>${tl(v.ex, L)}${L === 'ja' ? readingLine(v.exReading, v.exRomaji, L) : ''}<p class="exm">${esc(v.exm)}</p></div></div>` : ''}`;
+}
+
+// ---------- 联想笔记：自己编的联想最好记；忘了几次的卡片会提醒你编一个 ----------
+function memoBox(v, card) {
+  const n = noteOf(v.id) || {};
+  const leech = (card.lapses || 0) >= 2;
+  const canAI = aiReady();
+  return `<div class="memo ${leech ? 'leech' : ''}">
+    ${leech && !n.text ? `<p class="memo-nudge">这张已经忘了 ${card.lapses} 次。给它编一个联想（谐音、字形、画面都行），下次会好记很多。</p>` : ''}
+    ${n.text ? `<p class="memo-mine"><b>我的联想</b>${esc(n.text)}</p>` : ''}
+    ${n.ai ? `<p class="memo-ai"><b>AI 记忆法</b>${esc(n.ai)}</p>` : ''}
+    <div class="memo-edit" hidden><textarea rows="2" placeholder="例：${v.lang === 'ja' ? 'ぬ 像一根打了结的面条 → nu（面条 noodle）' : 'rue（街）读起来像"驴"——街上走着一头驴'}">${esc(n.text || '')}</textarea>
+      <div class="row"><button class="btn small primary" data-memo="save">保存</button><button class="btn small ghost" data-memo="cancel">取消</button></div></div>
+    <div class="memo-btns"><button class="link-btn" data-memo="edit">${n.text ? '改一下联想' : '写个联想'}</button>${canAI ? `<button class="link-btn" data-memo="ai">${n.ai ? 'AI 换一个' : 'AI 帮我想一个'}</button>` : ''}</div>
+  </div>`;
+}
+function bindMemo(el, v, card) {
+  const box = el.querySelector('.memo');
+  if (!box) return;
+  box.addEventListener('click', async e => {
+    const b = e.target.closest('[data-memo]');
+    if (!b) return;
+    e.stopPropagation();
+    const act = b.dataset.memo;
+    const edit = box.querySelector('.memo-edit');
+    if (act === 'edit') { edit.hidden = false; edit.querySelector('textarea').focus(); return; }
+    if (act === 'cancel') { edit.hidden = true; return; }
+    if (act === 'save') {
+      const t = edit.querySelector('textarea').value.trim();
+      setNote(v.id, { text: t });
+      box.outerHTML = memoBox(v, card);
+      bindMemo(el, v, card);
+      return;
+    }
+    if (act === 'ai') {
+      b.disabled = true; b.textContent = '想一想…';
+      try { setNote(v.id, { ai: await mnemonic(v.lang, v) }); box.outerHTML = memoBox(v, card); bindMemo(el, v, card); }
+      catch (err) { toast(err.message, 4000); b.disabled = false; b.textContent = 'AI 帮我想一个'; }
+    }
+  });
 }

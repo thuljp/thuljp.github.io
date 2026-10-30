@@ -428,6 +428,6 @@ export const scenes = [
 
 export const meta = {
   id: 'fr', name: '法语', native: 'Français', locale: 'fr-FR', flag: '🇫🇷',
-  soundLabel: '发音规则', soundUnit: '条',
-  tips: '法语拼写和读音的对应很规律。先用两周把发音规则过一遍，之后看到新词基本都能读出来。',
+  soundLabel: '发音', soundUnit: '个',
+  tips: '法语拼写和读音的对应很规律。先用一周把所有发音和拼读规则过一遍，之后看到新词基本都能读出来。',
 };

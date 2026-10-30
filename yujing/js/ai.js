@@ -225,3 +225,17 @@ export async function ask(lang, question, context = '') {
     { role: 'user', content: (context ? `相关内容：${context}\n\n` : '') + question },
   ], { temperature: 0.4, maxTokens: 800 });
 }
+
+// 记忆法：给难记的卡片编一个联想
+export async function mnemonic(lang, v) {
+  const M = LANGS[lang].meta;
+  let what;
+  if (v.kind === 'w') what = `单词「${v.front}」${v.reading ? `（读音 ${v.reading}）` : ''}，意思是「${v.meaning}」`;
+  else if (v.big) what = `假名「${v.front}」，读 ${v.meaning}${v.origin ? `，来自汉字「${v.origin}」` : ''}`;
+  else if (v.phoneme) what = `发音 /${v.item.ipa}/（拼写 ${v.item.spell.map(s => s[0]).join('、')}），例词 ${v.item.words.map(w => w[0]).join('、')}`;
+  else if (v.rule) what = `拼读规则「${v.item.title}」：${v.item.body}`;
+  else what = `句子「${v.front}」，意思是「${v.prompt}」`;
+  const prompt = `帮一位中文母语的${M.name}初学者记住：${what}。
+给一个简短、好记、有画面感的记忆法（谐音、拆字、字形联想、和中文或英文的联系都可以），不超过 50 个字。只输出记忆法本身，不要解释，不要加引号。`;
+  return (await chat([{ role: 'user', content: prompt }], { temperature: 0.9, maxTokens: 200 })).trim();
+}

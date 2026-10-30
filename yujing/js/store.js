@@ -1,5 +1,6 @@
 import * as FR from './data/fr.js';
 import * as JA from './data/ja.js';
+import * as FD from './data/found.js';
 import { newCard, schedule, isMature, isLearned, DAY } from './fsrs.js';
 import { dayKey, endOfDay, romaji, uid } from './util.js';
 
@@ -40,6 +41,8 @@ const DEFAULT = {
   custom: { fr: { scenes: [], words: [] }, ja: { scenes: [], words: [] } },
   readings: { fr: [], ja: [] },
   stamps: [],       // [{ lang, sceneId, text, date }]
+  found: {},        // 入门课进度 { 'ja|h1': { done, at, best, skipped } }
+  notes: {},        // 卡片联想笔记 { cardId: { text, ai, t } }
   lastNotified: '',
 };
 
@@ -60,6 +63,7 @@ function migrate(st) {
     for (const [k, v] of Object.entries(st.days)) mine[k] = maxRec(mine[k], v);
   }
   delete st.days;
+  for (const id of Object.keys(st.cards)) if (/^fr\|s\|r\d+$/.test(id)) delete st.cards[id];
   return st;
 }
 function deepMerge(base, add) {
@@ -116,7 +120,33 @@ export function scenesOf(lang) { return [...LANGS[lang].scenes, ...state.custom[
 export function findScene(lang, id) { return scenesOf(lang).find(s => s.id === id); }
 export function wordsOf(lang) { return [...LANGS[lang].words, ...state.custom[lang].words]; }
 export function grammarOf(lang) { return LANGS[lang].grammar; }
-export function soundsOf(lang) { return lang === 'ja' ? JA.kana : FR.sounds.map((s, i) => ({ id: 'r' + i, pat: s[0], ipa: s[1], tip: s[2], ex: s[3] })); }
+// 发音条目：日语 = 假名（带字源和例词）；法语 = 音素 + 拼读规则
+let soundCache = {};
+export function soundsOf(lang) {
+  if (soundCache[lang]) return soundCache[lang];
+  if (lang === 'ja') {
+    soundCache.ja = JA.kana.map(k => {
+      const base = k.k.length === 1 ? k.k : null;
+      const ex = base && FD.KANA_EX[base];
+      return { ...k, origin: base ? FD.KANA_ORIGIN[base] || '' : '', originNote: FD.ORIGIN_NOTE[k.k] || '', ex: ex ? { w: ex[0], r: ex[1], zh: ex[2], emoji: ex[3] } : null };
+    });
+  } else {
+    soundCache.fr = [...FD.FR_PHONEMES.map(p => ({ ...p, type: 'p' })), ...FD.FR_RULES.map(r => ({ ...r, type: 'g' }))];
+  }
+  return soundCache[lang];
+}
+export const soundById = (lang, id) => soundsOf(lang).find(x => x.id === id);
+export function counterpart(kanaItem) {   // 平假名 ↔ 片假名
+  const other = kanaItem.id.startsWith('h-') ? 'k-' : 'h-';
+  return soundsOf('ja').find(x => x.id.startsWith(other) && x.r === kanaItem.r && x.row === kanaItem.row);
+}
+export function confusables(lang, id) {
+  const groups = lang === 'ja' ? FD.JA_CONFUSE : FD.FR_CONFUSE;
+  const key = lang === 'ja' ? soundById('ja', id)?.k : id;
+  const out = new Set();
+  for (const g of groups) if (g.includes(key)) g.forEach(x => x !== key && out.add(x));
+  return lang === 'ja' ? [...out].map(k => soundsOf('ja').find(x => x.k === k)).filter(Boolean) : [...out].map(i => soundById('fr', i)).filter(Boolean);
+}
 
 const wordId = w => w[0];
 
@@ -135,8 +165,9 @@ export function cardView(id) {
   if (kind === 's') {
     const s = soundsOf(lang).find(x => x.id === ref);
     if (!s) return null;
-    if (lang === 'ja') return { id, lang, kind, front: s.k, meaning: s.r, tip: s.hint, set: s.set, speak: s.k, big: true };
-    return { id, lang, kind, front: s.pat, reading: s.ipa, meaning: s.tip, ex: s.ex, speak: s.ex.replace(/ · /g, ', '), sound: true };
+    if (lang === 'ja') return { id, lang, kind, front: s.k, meaning: s.r, tip: s.hint, set: s.set, speak: s.k, big: true, origin: s.origin, kex: s.ex, item: s };
+    if (s.type === 'p') return { id, lang, kind, phoneme: true, item: s, front: '/' + s.ipa + '/', label: s.label, speak: s.words.map(w => w[0]).join(', ') };
+    return { id, lang, kind, rule: true, item: s, front: s.q, speak: s.ex.join(', ') };
   }
   if (kind === 'c') {
     // 语块：产出卡（看中文说外语）
@@ -185,9 +216,12 @@ export function rate(id, g) {
 
 function introducedToday(lang, kind) { return state.intro[dayKey()]?.[lang + '|' + kind] || 0; }
 
+const viewable = id => { const [lang, , ref] = id.split('|'); return !!soundById(lang, ref); };
+
 // 新卡候选：未进卡库的条目，按顺序
 function newCandidates(lang, kind) {
-  if (kind === 's') return soundsOf(lang).map(s => `${lang}|s|${s.id}`).filter(id => !state.cards[id] || state.cards[id].state === 'new');
+  // 发音条目只来自入门课：课上没考到的（例如浊音、拗音这类规则课）按每日额度逐步进入复习
+  if (kind === 's') return soundsOf(lang).map(s => `${lang}|s|${s.id}`).filter(id => state.cards[id]?.state === 'new' && state.cards[id].lesson);
   // 单词：先学当前/已学场景相关词，再按词表顺序
   const doneScenes = new Set(Object.entries(state.scenes).filter(([k, v]) => k.startsWith(lang + '|') && v.step > 0).map(([k]) => k.split('|')[1]));
   const list = wordsOf(lang).map((w, i) => ({ id: `${lang}|w|${wordId(w)}`, tag: lang === 'fr' ? w[5] : w[6], i }));
@@ -200,6 +234,7 @@ export function queueFor(lang, { extraNew = 0 } = {}) {
   const due = [], learning = [];
   for (const [id, c] of Object.entries(state.cards)) {
     if (!id.startsWith(lang + '|') || c.state === 'new' || c.suspended) continue;
+    if (id.includes('|s|') && !viewable(id)) continue;
     if (c.state === 'learning' || c.state === 'relearning') learning.push(id);
     else if (c.due <= eod) due.push(id);
   }
@@ -208,7 +243,7 @@ export function queueFor(lang, { extraNew = 0 } = {}) {
   const st = state.settings;
   const wLeft = Math.max(0, st.newWords[lang] + extraNew - introducedToday(lang, 'w'));
   const sLeft = Math.max(0, st.newSounds[lang] - introducedToday(lang, 's'));
-  const newW = newCandidates(lang, 'w').slice(0, wLeft);
+  const newW = foundReady(lang) ? newCandidates(lang, 'w').slice(0, wLeft) : [];
   const newS = newCandidates(lang, 's').slice(0, sLeft);
   // 场景语块与纠错卡（state=new，已加入卡库）优先于普通新词
   const pending = Object.entries(state.cards).filter(([id, c]) => id.startsWith(lang + '|') && c.state === 'new' && (id.includes('|c|') || id.includes('|x|'))).map(([id]) => id);
@@ -228,7 +263,7 @@ export function stats(lang) {
     const c = state.cards[id];
     if (!isLearned(c)) continue;
     if (id.includes('|w|')) { words++; if (isMature(c)) wordsMature++; }
-    else if (id.includes('|s|')) sounds++;
+    else if (id.includes('|s|')) { if (viewable(id)) sounds++; }
     else chunks++;
   }
   const since = Date.now() - 30 * DAY;
@@ -237,6 +272,54 @@ export function stats(lang) {
   const soundTotal = soundsOf(lang).length;
   return { words, wordsMature, sounds, soundTotal, chunks, retention, reviewsLogged: recent.length };
 }
+
+// ---------- 入门课 ----------
+export const UNITS = { ja: FD.JA_UNITS, fr: FD.FR_UNITS };
+export const JA_PAIRS = FD.JA_PAIRS;
+export const JA_HOMOPHONE = FD.JA_HOMOPHONE;
+export const JA_SKIP = FD.JA_SKIP;
+
+export function unitItems(lang, unit) {
+  if (lang === 'ja') return unit.rows.flatMap(r => soundsOf('ja').filter(k => k.set === unit.set && k.row === r));
+  return unit.items.map(id => soundById('fr', id)).filter(Boolean);
+}
+export const unitState = (lang, id) => state.found[lang + '|' + id] || { done: false };
+export const nextUnit = lang => UNITS[lang].find(u => !unitState(lang, u.id).done) || null;
+export function foundProgress(lang) {
+  const us = UNITS[lang];
+  return { done: us.filter(u => unitState(lang, u.id).done).length, total: us.length };
+}
+export function foundReady(lang) {
+  return (lang === 'ja' ? FD.JA_WORD_GATE : FD.FR_WORD_GATE).every(id => unitState(lang, id).done);
+}
+// 'n' 未学 · 'l' 学习中 · 'm' 已牢固（间隔 ≥ 21 天）
+export function itemStatus(lang, itemId) {
+  const c = state.cards[`${lang}|s|${itemId}`];
+  return isMature(c) ? 'm' : isLearned(c) ? 'l' : 'n';
+}
+// 完成一课：课上答过的进入复习（答错过的间隔更短）；没考到的标记为"课上学过"，按每日额度进入复习
+export function completeUnit(lang, unit, results) {
+  const k = lang + '|' + unit.id, prev = state.found[k] || {};
+  state.found[k] = { done: true, at: prev.at || Date.now(), best: Math.max(prev.best || 0, results.score || 0) };
+  for (const it of unitItems(lang, unit)) {
+    const id = `${lang}|s|${it.id}`;
+    const c = ensureCard(id);
+    if (c.state !== 'new') continue;            // 已经在复习的，不打乱它的排程
+    const r = results.items[it.id];
+    if (r) rate(id, r.wrong ? 2 : 3);
+    else c.lesson = true;
+  }
+  save();
+}
+export function skipUnits(lang, ids) {
+  for (const id of ids) { const k = lang + '|' + id; if (!state.found[k]?.done) state.found[k] = { done: true, skipped: true, at: Date.now() }; }
+  save();
+}
+export function resetUnit(lang, id) { delete state.found[lang + '|' + id]; save(); }
+
+// ---------- 联想笔记 ----------
+export const noteOf = id => state.notes[id];
+export function setNote(id, patch) { state.notes[id] = { ...(state.notes[id] || {}), ...patch, t: Date.now() }; save(); }
 
 export function forecast(lang, days = 7) {
   const eod = endOfDay();
@@ -313,7 +396,7 @@ export function syncPayload(st = state) {
     app: 'yujing', v: 2, updatedAt: new Date().toISOString(),
     onboarded: st.onboarded, active: st.active, settings, settingsAt: st.settingsAt || 0,
     cards: st.cards, intro: st.intro, dd: st.dd, log: st.log, scenes: st.scenes,
-    custom: st.custom, readings: st.readings, stamps: st.stamps,
+    custom: st.custom, readings: st.readings, stamps: st.stamps, found: st.found, notes: st.notes,
   };
 }
 
@@ -373,6 +456,18 @@ export function mergeStates(local, remote) {
     if (!prev || x.date < prev.date) stamps.set(k, x);
   }
   out.stamps = [...stamps.values()].sort((a, b) => (a.date < b.date ? -1 : 1));
+
+  // 入门课：完成过就算完成；联想笔记：后写的生效
+  for (const [k, r] of Object.entries(remote.found || {})) {
+    const l = out.found[k];
+    if (!l) { out.found[k] = r; continue; }
+    const at = Math.min(l.at || Infinity, r.at || Infinity);
+    out.found[k] = { done: !!(l.done || r.done), at: at === Infinity ? undefined : at, best: Math.max(l.best || 0, r.best || 0) || undefined, ...(l.skipped && r.skipped ? { skipped: true } : {}) };
+  }
+  for (const [id, r] of Object.entries(remote.notes || {})) {
+    const l = out.notes[id];
+    if (!l || (r.t || 0) > (l.t || 0)) out.notes[id] = r;
+  }
 
   // 学习计划设置：后改的生效
   const lAt = local.settingsAt || 0, rAt = remote.settingsAt || 0;

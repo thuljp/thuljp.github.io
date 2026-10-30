@@ -1,10 +1,10 @@
 // 离线缓存：应用外壳先走网络、失败再用缓存（保证更新及时）；AI 请求不缓存
-const CACHE = 'yujing-v2';
+const CACHE = 'yujing-v3';
 const SHELL = [
   './', 'index.html', 'css/style.css', 'icon.svg', 'manifest.webmanifest',
   'js/app.js', 'js/store.js', 'js/fsrs.js', 'js/util.js', 'js/ui.js', 'js/speech.js', 'js/ai.js', 'js/reminder.js', 'js/sync.js',
-  'js/data/fr.js', 'js/data/ja.js',
-  'js/views/review.js', 'js/views/scene.js', 'js/views/library.js', 'js/views/progress.js', 'js/views/settings.js',
+  'js/data/fr.js', 'js/data/ja.js', 'js/data/found.js',
+  'js/views/review.js', 'js/views/scene.js', 'js/views/library.js', 'js/views/progress.js', 'js/views/settings.js', 'js/views/learn.js',
 ];
 
 self.addEventListener('install', e => {

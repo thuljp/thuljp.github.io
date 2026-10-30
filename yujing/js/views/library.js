@@ -1,4 +1,4 @@
-import { S, wordsOf, soundsOf, grammarOf, LANGS, addCustomWords, ensureCard, save, addReading, addInput, findScene } from '../store.js';
+import { S, wordsOf, grammarOf, LANGS, addCustomWords, ensureCard, save, addReading, addInput, findScene } from '../store.js';
 import { isMature, isLearned } from '../fsrs.js';
 import { aiReady, generateWords, generateReading, ask } from '../ai.js';
 import { speak, stop } from '../speech.js';
@@ -12,14 +12,17 @@ function status(id) {
   return ['n', '未学'];
 }
 
+export function baseTabs(cur) {
+  const tabs = [['map', '发音全景', '#/map'], ['words', '单词', '#/library/words'], ['grammar', '语法', '#/library/grammar']];
+  return `<div class="seg tabs" role="tablist">${tabs.map(([k, n, h]) => `<a role="tab" href="${h}" class="${k === cur ? 'on' : ''}" aria-selected="${k === cur}">${n}</a>`).join('')}</div>`;
+}
+
 export function renderLibrary(el, lang, tab = 'words') {
   const M = LANGS[lang].meta;
-  const tabs = [['words', '单词'], ['sounds', M.soundLabel], ['grammar', '语法']];
-  el.innerHTML = `${header('词库')}
-    <div class="seg tabs" role="tablist">${tabs.map(([k, n]) => `<a role="tab" href="#/library/${k}" class="${k === tab ? 'on' : ''}" aria-selected="${k === tab}">${n}</a>`).join('')}</div>
+  el.innerHTML = `${header('基础')}${baseTabs(tab)}
     <section class="lib-body"></section>`;
   const body = el.querySelector('.lib-body');
-  ({ words, sounds, grammar })[tab]();
+  ({ words, grammar })[tab === 'grammar' ? 'grammar' : 'words']();
 
   function words() {
     const list = wordsOf(lang);
@@ -57,31 +60,6 @@ export function renderLibrary(el, lang, tab = 'words') {
         renderLibrary(el, lang, 'words');
       } catch (err) { toast(err.message, 5000); busy(b, false); }
     };
-  }
-
-  function sounds() {
-    const list = soundsOf(lang);
-    if (lang === 'ja') {
-      const sets = ['平假名', '片假名'];
-      body.innerHTML = `<p class="step-lede">${esc(M.tips)} 点任意假名听发音。颜色表示掌握程度。</p>
-        ${sets.map(set => {
-          const items = list.filter(k => k.set === set);
-          const rows = [...new Set(items.map(k => k.row))];
-          return `<h2>${set}</h2><div class="kana-grid">${rows.map(r => `<div class="kana-row">${items.filter(k => k.row === r).map(k => {
-            const [s] = status(`ja|s|${k.id}`);
-            return `<button class="kana ${s}" data-say="${esc(k.k)}" data-lang="ja" title="${esc(k.r)}"><span lang="ja">${esc(k.k)}</span><small>${esc(k.r)}</small></button>`;
-          }).join('')}</div>`).join('')}</div>`;
-        }).join('')}`;
-    } else {
-      body.innerHTML = `<p class="step-lede">${esc(M.tips)}</p>
-        <ul class="rules">${list.map(r => {
-          const [s, label] = status(`fr|s|${r.id}`);
-          return `<li><span class="dot ${s}" aria-label="${label}"></span>
-            <div class="rule-pat">${tl(r.pat, 'fr')}<span class="ipa">${esc(r.ipa)}</span></div>
-            <p>${esc(r.tip)}</p>
-            <p class="rule-ex">${playBtn(r.ex.replace(/ · /g, ', '), 'fr', { label: '听例词' })}${tl(r.ex, 'fr')}</p></li>`;
-        }).join('')}</ul>`;
-    }
   }
 
   function grammar() {
