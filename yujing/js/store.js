@@ -1,14 +1,15 @@
 import * as FR from './data/fr.js';
 import * as JA from './data/ja.js';
 import * as FD from './data/found.js';
-import * as CF from './data/course_fr.js';
-import * as CJ from './data/course_ja.js';
+import { COURSE_DATA as CD, LEVELS as CL, levelOf as clevel } from './data/course_index.js';
 import { newCard, schedule, isMature, isLearned, DAY } from './fsrs.js';
 import { dayKey, endOfDay, romaji, uid } from './util.js';
 
 export const LANGS = { fr: FR, ja: JA };
-export const COURSE_DATA = { fr: CF, ja: CJ };
-export const COURSE = { fr: CF.units, ja: CJ.units };
+export const COURSE_DATA = CD;
+export const COURSE = { fr: CD.fr.units, ja: CD.ja.units };
+export const LEVELS = CL;
+export const levelOf = clevel;
 const KEY = 'yujing.v1';
 
 // 每台设备一个固定 id：每日统计按设备分开记，多设备同步时相加而不是互相覆盖
@@ -123,9 +124,15 @@ export function addSpeak(sec) { if (sec > 0) { today().speakSec += sec; save(); 
 export function scenesOf(lang) { return [...LANGS[lang].scenes, ...state.custom[lang].scenes]; }
 export function findScene(lang, id) { return scenesOf(lang).find(s => s.id === id); }
 const courseWords = {}, grammarAll = {};
+// 词库 = 内置词 + 课程新词 + AI 补充的词；同一个词只保留第一次出现的那条
 export function wordsOf(lang) {
-  courseWords[lang] ||= COURSE[lang].flatMap(u => u.newWords);
-  return [...LANGS[lang].words, ...courseWords[lang], ...state.custom[lang].words];
+  if (!courseWords[lang]) {
+    const seen = new Set(LANGS[lang].words.map(w => w[0]));
+    courseWords[lang] = COURSE[lang].flatMap(u => u.newWords).filter(w => !seen.has(w[0]) && seen.add(w[0]));
+  }
+  const all = [...LANGS[lang].words, ...courseWords[lang]];
+  const have = new Set(all.map(w => w[0]));
+  return [...all, ...state.custom[lang].words.filter(w => !have.has(w[0]))];
 }
 export function grammarOf(lang) { return (grammarAll[lang] ||= [...LANGS[lang].grammar, ...COURSE_DATA[lang].grammar]); }
 // 发音条目：日语 = 假名（带字源和例词）；法语 = 音素 + 拼读规则
@@ -195,7 +202,7 @@ export function cardView(id) {
     const st = u?.sentences[+idx];
     if (!st) return null;
     const ja = lang === 'ja';
-    return { id, lang, kind, prod: true, prompt: ja ? st[2] : st[1], front: st[0], reading: ja ? st[1] : '', romaji: ja ? romaji(st[1]) : '', speak: st[0], scene: '第' + u.id.slice(1) + '课 · ' + u.title };
+    return { id, lang, kind, prod: true, prompt: ja ? st[2] : st[1], front: st[0], reading: ja ? st[1] : '', romaji: ja ? romaji(st[1]) : '', speak: st[0], scene: '第 ' + (COURSE[lang].indexOf(u) + 1) + ' 课 · ' + u.title };
   }
   if (kind === 'x') {
     const card = state.cards[id];
@@ -345,7 +352,7 @@ const cwCache = {};
 export function courseWordUnits(lang) {   // 词 → 第一次出现的课
   if (cwCache[lang]) return cwCache[lang];
   const m = {};
-  for (const u of COURSE[lang]) for (const k of [...u.words, ...u.newWords.map(w => w[0])]) m[k] ||= u.id;
+  for (const u of COURSE[lang]) for (const k of [...(u.words || []), ...u.newWords.map(w => w[0])]) m[k] ||= u.id;
   return (cwCache[lang] = m);
 }
 export const courseUnit = (lang, id) => COURSE[lang].find(u => u.id === id);
@@ -356,8 +363,8 @@ export function courseProgress(lang) {
   return { done: us.filter(u => courseState(lang, u.id).done).length, total: us.length };
 }
 export function unitWords(lang, unit) {
-  const all = wordsOf(lang);
-  return [...unit.words, ...unit.newWords.map(w => w[0])].map(k => all.find(w => w[0] === k)).filter(Boolean);
+  const m = new Map(wordsOf(lang).map(w => [w[0], w]));
+  return [...new Set([...(unit.words || []), ...unit.newWords.map(w => w[0])])].map(k => m.get(k)).filter(Boolean);
 }
 // 学过的语法点：出现在已完成的课里
 export function grammarLearned(lang) {
@@ -392,7 +399,7 @@ export function completeCourse(lang, unit, results) {
   }
   let sents = 0;
   unit.sentences.forEach((_, i) => { const id = `${lang}|u|${unit.id}#${i}`; if (!state.cards[id]) { ensureCard(id); sents++; } });
-  if (first) state.stamps.push({ lang, sceneId: 'course-' + unit.id, text: unit.can, title: '第' + unit.id.slice(1) + '课 ' + unit.title, emoji: unit.emoji, date: dayKey() });
+  if (first) state.stamps.push({ lang, sceneId: 'course-' + unit.id, text: unit.can, title: '第 ' + (COURSE[lang].indexOf(unit) + 1) + ' 课 ' + unit.title, emoji: unit.emoji, date: dayKey() });
   save();
   return { first, words, sents };
 }

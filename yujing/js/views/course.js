@@ -1,7 +1,7 @@
 // 核心课程：课程路线（#/course）、一课（#/unit/:id）、知识体系（#/library/grammar）
 import {
   kanaSpeech, S, LANGS, COURSE, COURSE_DATA, courseUnit, courseState, nextCourse, courseProgress, unitWords, grammarOf, grammarLearned,
-  completeCourse, foundProgress, foundReady, nextUnit, UNITS, findScene, practicePool, addSpeak,
+  completeCourse, foundProgress, foundReady, nextUnit, UNITS, findScene, practicePool, addSpeak, LEVELS,
 } from '../store.js';
 import { speak, stop, sttAvailable, listen } from '../speech.js';
 import { esc, romaji, shuffle, toast, similarity } from '../util.js';
@@ -35,17 +35,24 @@ export function renderCourse(el, lang) {
     </section>
 
     <section class="stage ${cp.done === cp.total ? 'done' : ready ? 'now' : ''}">
-      <div class="stage-head"><span class="stage-no">2</span><div><h2>核心课程 A1</h2><p class="muted">12 课 · 每课约 15 分钟 · ${cp.done}/${cp.total}</p></div></div>
+      <div class="stage-head"><span class="stage-no">2</span><div><h2>核心课程 A1 → B2</h2><p class="muted">${cp.total} 课 · 每课约 15–25 分钟 · 已学 ${cp.done}</p></div></div>
       <div class="m-bar"><i style="width:${Math.round(cp.done / cp.total * 100)}%"></i></div>
-      <p class="stage-note">每课一个真实情景：先听对话，再学新词和语法，最后做听、选、拼、说的练习。学完 12 课，覆盖欧洲语言框架 A1 的核心语法。${!ready ? '<br><b>建议先完成发音入门</b>，不过也可以先进来看看。' : ''}</p>
-      <ol class="path">${COURSE[lang].map((u, i) => {
-        const st = courseState(lang, u.id);
-        const cls = st.done ? 'done' : u === nc ? 'next' : '';
-        return `<li class="${cls}"><a href="#/unit/${u.id}">
-          <span class="p-node">${st.done ? '✓' : u.emoji}</span>
-          <span class="p-main"><small>第 ${i + 1} 课 · ${esc(u.sub)}</small><b ${lang === 'ja' ? 'lang="ja"' : ''}>${esc(u.title)}</b><em>${esc(u.can)}</em></span>
-          <span class="p-state">${st.done ? (st.best ? st.best + '%' : '') : u === nc ? '开始' : ''}</span></a></li>`;
-      }).join('')}</ol>
+      <p class="stage-note">四个级别${lang === 'ja' ? '（对应日语能力考试 N5 → N2）' : '（欧洲语言共同参考框架）'}。每课一个真实情景或一篇短文：先听，再学新词和语法，最后做听、选、拼、说的练习。${!ready ? '<br><b>建议先完成发音入门</b>，不过也可以先进来看看。' : ''}</p>
+      ${LEVELS[lang].map(([lv, name, desc]) => {
+        const us = COURSE[lang].filter(u => u.level === lv);
+        const d = us.filter(u => courseState(lang, u.id).done).length;
+        const open = nc ? nc.level === lv : lv === 'A1';
+        return `<details class="lv" ${open ? 'open' : ''}><summary><span class="lv-tag">${lv}</span><span class="lv-main"><b>${esc(name)}</b><small>${esc(desc)}</small></span><span class="lv-n">${d}/${us.length}</span></summary>
+          <div class="m-bar thin"><i style="width:${us.length ? Math.round(d / us.length * 100) : 0}%"></i></div>
+          <ol class="path">${us.map(u => {
+            const st = courseState(lang, u.id);
+            const cls = st.done ? 'done' : u === nc ? 'next' : '';
+            return `<li class="${cls}"><a href="#/unit/${u.id}">
+              <span class="p-node">${st.done ? '✓' : u.emoji}</span>
+              <span class="p-main"><small>第 ${unitNo(lang, u)} 课 · ${esc(u.sub)}</small><b ${lang === 'ja' ? 'lang="ja"' : ''}>${esc(u.title)}</b><em>${esc(u.can)}</em></span>
+              <span class="p-state">${st.done ? (st.best ? st.best + '%' : '') : u === nc ? '开始' : ''}</span></a></li>`;
+          }).join('')}</ol></details>`;
+      }).join('')}
     </section>
 
     <section class="stage ${cp.done ? 'now' : ''}">
@@ -58,28 +65,32 @@ export function renderCourse(el, lang) {
 // ======================================================================
 // 知识体系：所有语法点按类别排好，标出学没学过、在哪一课学
 // ======================================================================
-export function renderKnowledge(el, lang) {
+export function renderKnowledge(el, lang, filter) {
   const D = COURSE_DATA[lang];
-  const all = grammarOf(lang);
   const learned = grammarLearned(lang);
-  const byCat = {};
+  const lvOf = g => { const L = learned[g.id]; return L ? courseUnit(lang, L.unit)?.level || '' : ''; };
   const ord = g => { const L = learned[g.id]; return L ? COURSE[lang].findIndex(u => u.id === L.unit) : -1; };
+  let all = grammarOf(lang);
+  const total = all.length, nDone = all.filter(g => learned[g.id]?.done).length;
+  const lv = (filter && LEVELS[lang].some(([l]) => l === filter)) ? filter : '';
+  if (lv) all = all.filter(g => lvOf(g) === lv);
+  const byCat = {};
   for (const g of [...all].sort((a, b) => ord(a) - ord(b))) (byCat[D.CAT[g.id] || '其他'] ||= []).push(g);
   const cats = [...D.CAT_ORDER, ...Object.keys(byCat).filter(c => !D.CAT_ORDER.includes(c))].filter(c => byCat[c]);
-  const nDone = all.filter(g => learned[g.id]?.done).length;
   const unitLabel = id => { const u = courseUnit(lang, id); return u ? `第 ${unitNo(lang, u)} 课` : ''; };
   el.innerHTML = `${header('课程')}${baseTabs('grammar')}
-    <p class="lede">${LANGS[lang].meta.name} A1 的语法骨架。每个点都在某一课的情景里第一次出现；学完那一课就点亮。点进去看讲解和例句，也可以问 AI 老师。</p>
-    <div class="km-sum"><b>${nDone}</b> / ${all.length} 个语法点已学<div class="m-bar"><i style="width:${Math.round(nDone / all.length * 100)}%"></i></div></div>
+    <p class="lede">${LANGS[lang].meta.name}从 A1 到 B2 的语法骨架。每个点都在某一课里第一次出现，学完那一课就点亮。点进去看讲解和例句，也可以问 AI 老师。</p>
+    <div class="km-sum"><b>${nDone}</b> / ${total} 个语法点已学<div class="m-bar"><i style="width:${Math.round(nDone / total * 100)}%"></i></div></div>
+    <div class="seg km-filter">${[['', '全部'], ...LEVELS[lang].map(([l]) => [l, l])].map(([k, n]) => `<a href="#/library/grammar${k ? '/' + k : ''}" class="${k === lv ? 'on' : ''}">${n}</a>`).join('')}</div>
     ${cats.map(c => {
       const list = byCat[c];
       const d = list.filter(g => learned[g.id]?.done).length;
       return `<section class="km-cat"><h2>${esc(c)} <span class="muted">${d}/${list.length}</span></h2>
         <ul class="km-list">${list.map(g => {
           const L = learned[g.id];
-          return `<li class="${L?.done ? 'done' : ''}"><a href="#/grammar/${g.id}"><span class="km-dot" aria-hidden="true"></span><span class="km-t">${esc(g.title)}</span><small>${L ? (L.done ? '已学 · ' : '') + unitLabel(L.unit) : '发音入门'}</small></a></li>`;
+          return `<li class="${L?.done ? 'done' : ''}"><a href="#/grammar/${g.id}"><span class="km-dot" aria-hidden="true"></span><span class="km-t">${esc(g.title)}</span><small>${L ? `<i class="lv-mini">${lvOf(g)}</i>${L.done ? '已学 · ' : ''}${unitLabel(L.unit)}` : '发音入门'}</small></a></li>`;
         }).join('')}</ul></section>`;
-    }).join('')}`;
+    }).join('') || '<p class="hint">这个级别还没有语法点。</p>'}`;
 }
 
 // ======================================================================
@@ -99,6 +110,8 @@ export function renderUnit(el, lang, id) {
   const G = unit.grammar.map(g => grammarOf(lang).find(x => x.id === g)).filter(Boolean);
   const DL = unit.dialogue.map(d => ja ? { who: d[0], t: d[1], r: d[2], zh: d[3] } : { who: d[0], t: d[1], zh: d[2] });
   const SE = unit.sentences.map(s => ja ? { t: s[0], r: s[1], zh: s[2] } : { t: s[0], zh: s[1] });
+  const isText = DL.filter(d => !d.who).length > DL.length / 2;     // 课文（旁白为主）而不是对话
+  const mins = { A1: 15, A2: 20, B1: 25, B2: 25 }[unit.level] || 15;
   const results = { words: {}, first: 0, total: 0 };
   const st = courseState(lang, unit.id);
   const say = (text, o = {}) => speak(text, lang, { count: true, ...o });
@@ -113,18 +126,18 @@ export function renderUnit(el, lang, id) {
     stop(); keys = null;
     el.innerHTML = `${top(`第 ${no} 课`, 0)}
       <section class="lesson-intro unit-intro">
-        <p class="muted">核心课程 · 第 ${no} 课</p>
+        <p class="muted">核心课程 · <span class="lv-tag sm">${unit.level}</span> 第 ${no} 课</p>
         <div class="u-emoji" aria-hidden="true">${unit.emoji}</div>
         <h1 ${ja ? 'lang="ja"' : ''}>${esc(unit.title)}</h1>
         <p class="u-sub">${esc(unit.sub)}</p>
         <div class="goal"><b>学完这课，你能</b><p>${esc(unit.can)}</p></div>
         <ol class="u-plan">
-          <li><span>🎬</span>情景对话<small>${DL.length} 句</small></li>
+          <li><span>${isText ? '📖' : '🎬'}</span>${isText ? '课文' : '情景对话'}<small>${DL.length} 句</small></li>
           <li><span>🧩</span>词汇<small>${W.length} 个${W.some(w => w.isNew) ? `，其中新词 ${W.filter(w => w.isNew).length}` : ''}</small></li>
           <li><span>💡</span>语法<small>${G.map(g => esc(g.title)).join('；')}</small></li>
           <li><span>✍️</span>练习<small>听 · 选 · 拼 · 接话 · 开口</small></li>
         </ol>
-        <button class="btn primary wide" id="go">开始 · 约 15 分钟</button>
+        <button class="btn primary wide" id="go">开始 · 约 ${mins} 分钟</button>
         ${st.done ? `<p class="hint center">已学过（首次答对 ${st.best || 0}%）。再学一遍会重新计分，但不会打乱复习安排。</p>` : ''}
       </section>`;
     el.querySelector('#go').onclick = () => dialogue();
@@ -134,16 +147,16 @@ export function renderUnit(el, lang, id) {
   // ---- 1. 情景对话：一句一句出现 ----
   function dialogue() {
     let shown = 0, showZh = false;
-    el.innerHTML = `${top('情景对话', 8)}
+    el.innerHTML = `${top(isText ? '课文' : '情景对话', 8)}
       <section class="dlg-wrap">
-        <h2>🎬 先听，猜猜他们在说什么</h2>
+        <h2>${isText ? '📖 先听一遍，再看文字' : '🎬 先听，猜猜他们在说什么'}</h2>
         <p class="hint">点"继续"出现下一句；点任意一句可以重听。不懂没关系，后面会逐个拆开学。</p>
         <ol class="dlg"></ol>
         <div class="learn-nav"><button class="btn ghost" id="zh">显示中文</button><button class="btn ghost" id="again">${ICON.play}重听</button><button class="btn primary" id="next">继续</button></div>
       </section>`;
     const ol = el.querySelector('.dlg'), nx = el.querySelector('#next');
-    const line = (d, i) => `<li class="${isMe(d.who) ? 'me' : 'other'}" data-i="${i}"><span class="who">${esc(d.who)}</span><div class="bubble">${tl(d.t, lang)}${rd(d.r)}<span class="zh">${esc(d.zh)}</span></div></li>`;
-    const playLine = i => { ol.querySelectorAll('li').forEach(li => li.classList.toggle('now', +li.dataset.i === i)); return say(DL[i].t, { alt: !isMe(DL[i].who) }); };
+    const line = (d, i) => `<li class="${!d.who ? 'narr' : isMe(d.who) ? 'me' : 'other'}" data-i="${i}">${d.who ? `<span class="who">${esc(d.who)}</span>` : ''}<div class="bubble">${tl(d.t, lang)}${rd(d.r)}<span class="zh">${esc(d.zh)}</span></div></li>`;
+    const playLine = i => { ol.querySelectorAll('li').forEach(li => li.classList.toggle('now', +li.dataset.i === i)); return say(DL[i].t, { alt: !!DL[i].who && !isMe(DL[i].who) }); };
     const step = () => {
       if (shown >= DL.length) return words();
       ol.insertAdjacentHTML('beforeend', line(DL[shown], shown));
@@ -225,15 +238,16 @@ export function renderUnit(el, lang, id) {
   }
 
   // ---- 3a. 发现规律：先猜，再看规则 ----
-  function grammarIntro() {
+  function grammarIntro(k = 0) {
     stop();
     const qs = unit.discover || [];
-    if (!qs.length) return grammar(0);
-    const q = qs[0];
+    if (k >= qs.length) return grammar(0);
+    const q = qs[k];
+    const nextStep = () => grammarIntro(k + 1);
     const order = shuffle(q.opts.map((o, i) => ({ o, i })));
     el.innerHTML = `${top('发现规律', 46)}
       <section class="quiz">
-        <p class="eyebrow">💡 先猜一猜</p>
+        <p class="eyebrow">💡 先猜一猜${qs.length > 1 ? ` ${k + 1}/${qs.length}` : ''}</p>
         <p class="q-prompt">${esc(q.q)}</p>
         <div class="q-opts n${order.length}">${order.map((x, j) => `<button class="q-opt" data-j="${j}"><kbd>${j + 1}</kbd><span class="ow" lang="${lang}">${esc(x.o)}</span></button>`).join('')}</div>
         <div class="q-feedback" aria-live="polite"></div>
@@ -243,9 +257,9 @@ export function renderUnit(el, lang, id) {
       if (done) return; done = true;
       const ok = order[j].i === q.a;
       el.querySelectorAll('.q-opt').forEach((b, k) => { b.disabled = true; if (order[k].i === q.a) b.classList.add('right'); else if (k === j) b.classList.add('wrong'); });
-      el.querySelector('.q-feedback').innerHTML = `<div class="q-explain ${ok ? 'good' : ''}"><b>${ok ? '猜对了！' : '其实是这样：'}</b>${esc(q.why)}</div><button class="btn primary wide" id="cont">看完整规则</button>`;
-      el.querySelector('#cont').onclick = () => grammar(0);
-      keys = e => { if (e.key === 'Enter') grammar(0); };
+      el.querySelector('.q-feedback').innerHTML = `<div class="q-explain ${ok ? 'good' : ''}"><b>${ok ? '猜对了！' : '其实是这样：'}</b>${esc(q.why)}</div><button class="btn primary wide" id="cont">${k + 1 < qs.length ? '再猜一题' : '看完整规则'}</button>`;
+      el.querySelector('#cont').onclick = nextStep;
+      keys = e => { if (e.key === 'Enter') nextStep(); };
     };
     el.querySelectorAll('.q-opt').forEach(b => b.onclick = () => pick(+b.dataset.j));
     keys = e => { if (/^[1-4]$/.test(e.key) && +e.key <= order.length) pick(+e.key - 1); };
@@ -419,6 +433,7 @@ export function renderUnit(el, lang, id) {
         <p class="muted">第 ${no} 课完成</p>
         <h1 ${ja ? 'lang="ja"' : ''}>${esc(unit.title)}</h1>
         <p class="can-do">✓ ${esc(unit.can)}</p>
+        ${nc && nc.level !== unit.level ? `<p class="ok-text">🎉 ${unit.level} 阶段完成！下一站：${nc.level}。</p>` : ''}
         <ul class="done-stats"><li>首次答对 <b>${results.score}%</b></li><li>新进复习的词 <b>${r.words}</b></li><li>开口句卡 <b>${r.sents}</b></li></ul>
         <div class="lit">${G.map((g, i) => `<span style="--d:${i * 80}ms">${esc(g.title)}</span>`).join('')}</div>
         <p class="done-note">词和句子会在快要忘的时候出现在复习里。趁热打铁，用下面任意一种方式把这课"用"一次：</p>
@@ -427,7 +442,7 @@ export function renderUnit(el, lang, id) {
           <a class="nx" href="#/practice/write?u=${unit.id}"><span>✍️</span><b>写几句</b><small>${esc(unit.write.prompt.slice(0, 18))}…</small></a>
           <a class="nx" href="#/practice/dictation"><span>🎧</span><b>听写</b><small>练耳朵和拼写</small></a>
         </div>
-        <div class="row">${nc ? `<a class="btn primary" href="#/unit/${nc.id}">下一课：${esc(nc.title)}</a>` : '<p class="ok-text">12 课全部完成！A1 的骨架已经搭好了。</p>'}<a class="btn ghost" href="#/course">回课程</a></div>
+        <div class="row">${nc ? `<a class="btn primary" href="#/unit/${nc.id}">下一课：${esc(nc.title)}</a>` : `<p class="ok-text">${COURSE[lang].length} 课全部完成！从 A1 到 B2 的路走完了。</p>`}<a class="btn ghost" href="#/course">回课程</a></div>
       </section>`;
   }
 }
@@ -453,18 +468,18 @@ function buildUnitQuestions(lang, unit, DL, SE) {
   });
   // 选词填空：全部
   unit.cloze.forEach((c, i) => {
-    const [sent, opts, a, zh, why] = c;
+    const [sent, opts, a, zh, why, cr] = c;
     const filled = stripHint(sent.replace('___', opts[a]));
     qs.push({ type: 'cloze', key: 'c' + i, label: '✏️ 选词填空',
-      prompt: `<span class="q-sent" lang="${lang}">${esc(ja ? sent : frSpace(sent)).replace('___', '<b class="blank">　?　</b>')}</span><span class="q-zh">${esc(zh)}</span>`,
+      prompt: `<span class="q-sent" lang="${lang}">${esc(ja ? sent : frSpace(sent)).replace('___', '<b class="blank">　?　</b>')}</span>${ja && cr ? `<span class="reading" lang="ja">${esc(cr).replace('___', '＿＿')}</span>` : ''}<span class="q-zh">${esc(zh)}</span>`,
       options: shuffle(opts.map((o, j) => ({ html: `<span class="ow" lang="${lang}">${esc(o)}</span>`, correct: j === a }))), why, after: filled });
   });
   // 拼句子 ×2（选长一点的句子）
-  shuffle(SE).filter(s => tilesOf(lang, s).length >= 3).slice(0, 2).forEach((s, i) => {
+  shuffle(SE).filter(s => { const n = tilesOf(lang, s).length; return n >= 3 && n <= 14; }).slice(0, 2).forEach((s, i) => {
     qs.push({ type: 'build', key: 'b' + i, label: '🧱 拼出这句话', zh: s.zh, t: s.t, r: s.r, tiles: tilesOf(lang, s) });
   });
   // 对话接话 ×2
-  const turns = DL.map((d, i) => i).filter(i => i + 1 < DL.length && !isMe(DL[i].who) && isMe(DL[i + 1].who));
+  const turns = DL.map((d, i) => i).filter(i => i + 1 < DL.length && DL[i].who && !isMe(DL[i].who) && isMe(DL[i + 1].who));
   shuffle(turns).slice(0, 2).forEach((i, k) => {
     const ans = DL[i + 1];
     const mine = DL.filter(d => isMe(d.who) && d.t !== ans.t);

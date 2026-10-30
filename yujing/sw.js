@@ -1,9 +1,10 @@
 // 离线缓存：应用外壳先走网络、失败再用缓存（保证更新及时）；AI 请求不缓存
-const CACHE = 'yujing-v5';
+const CACHE = 'yujing-v6';
 const SHELL = [
   './', 'index.html', 'css/style.css', 'icon.svg', 'manifest.webmanifest',
   'js/app.js', 'js/store.js', 'js/fsrs.js', 'js/util.js', 'js/ui.js', 'js/speech.js', 'js/ai.js', 'js/reminder.js', 'js/sync.js',
   'js/data/fr.js', 'js/data/ja.js', 'js/data/found.js', 'js/data/course_fr.js', 'js/data/course_ja.js',
+  'js/data/course_index.js', 'js/data/course/fr_a1.js', 'js/data/course/fr_a2a.js', 'js/data/course/fr_a2b.js', 'js/data/course/fr_b1a.js', 'js/data/course/fr_b1b.js', 'js/data/course/fr_b2a.js', 'js/data/course/fr_b2b.js', 'js/data/course/ja_a1.js', 'js/data/course/ja_a2a.js', 'js/data/course/ja_a2b.js', 'js/data/course/ja_b1a.js', 'js/data/course/ja_b1b.js', 'js/data/course/ja_b2a.js', 'js/data/course/ja_b2b.js',
   'js/views/review.js', 'js/views/scene.js', 'js/views/library.js', 'js/views/progress.js', 'js/views/settings.js', 'js/views/learn.js', 'js/views/course.js', 'js/views/practice.js',
 ];
 

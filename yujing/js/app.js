@@ -66,7 +66,7 @@ function route() {
     case 'course': return renderCourse(view, lang);
     case 'unit': return renderUnit(view, lang, parts[1]);
     case 'practice': return renderPractice(view, lang, parts[1], new URLSearchParams(query || ''));
-    case 'library': return parts[1] === 'sounds' ? renderMap(view, lang) : parts[1] === 'grammar' ? renderKnowledge(view, lang) : renderLibrary(view, lang, parts[1] || 'words');
+    case 'library': return parts[1] === 'sounds' ? renderMap(view, lang) : parts[1] === 'grammar' ? renderKnowledge(view, lang, parts[2]) : renderLibrary(view, lang, parts[1] || 'words');
     case 'grammar': return renderGrammar(view, lang, parts[1], from);
     case 'read': return renderRead(view, lang, parts[1]);
     case 'progress': return renderProgress(view, lang);
@@ -156,7 +156,7 @@ function renderToday(el, lang) {
     ${!ready ? `<section class="panel method">
       <h2>零基础怎么开始</h2>
       <p><b>① 发音入门</b>：每天 1–2 节，${lang === 'ja' ? '大约两周把平假名、片假名和发音规则过一遍' : '大约一周把法语的所有发音和拼读规则过一遍'}。</p>
-      <p><b>② 核心课程</b>：12 课，每课一个真实情景，系统学完 A1 的核心语法和高频词。</p>
+      <p><b>② 核心课程</b>：${COURSE[lang].length} 课，从 A1 到 B2${lang === 'ja' ? '（N5 → N2）' : ''}，每课一个真实情景或一篇短文，系统学完语法和高频词。</p>
       <p><b>③ 进阶练习</b>：听写、跟读、写作、场景对话、阅读，把学过的东西反复用起来。学过的内容会在快要忘的时候出现在<b>复习</b>里。</p>
       <a class="btn ghost" href="#/course">看课程路线</a>
     </section>` : ''}
