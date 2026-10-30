@@ -83,7 +83,7 @@ export function renderScene(el, lang, id, stepParam) {
       <div class="step-next"><button class="btn primary" id="next">下一步：沉浸听</button></div>`;
     body.querySelector('#all').onclick = async e => {
       const b = e.currentTarget; b.disabled = true;
-      for (const c of chunks) { if (!location.hash.includes(id)) break; await speak(c.t, lang); await pause(600); }
+      for (const c of chunks) { if (!location.hash.includes(id)) break; if (!(await speak(c.t, lang))) break; await pause(600); }
       b.disabled = false;
     };
     body.querySelector('#next').onclick = () => finishStep(1);
@@ -125,7 +125,7 @@ export function renderScene(el, lang, id, stepParam) {
       const b = e.currentTarget;
       if (playing) { playing = false; stop(); b.innerHTML = ICON.play + '播放整段对话'; return; }
       playing = true; b.innerHTML = ICON.stop + '停止';
-      for (let i = 0; i < lines.length && playing; i++) { await sayLine(i); await pause(450); }
+      for (let i = 0; i < lines.length && playing; i++) { if (!(await sayLine(i))) break; await pause(450); }
       playing = false; b.innerHTML = ICON.play + '再听一遍';
       dl.querySelectorAll('li').forEach(li => li.classList.remove('now'));
     };

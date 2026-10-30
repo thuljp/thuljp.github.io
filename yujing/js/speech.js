@@ -27,31 +27,61 @@ function score(v) {
 
 export const ttsAvailable = () => !!synth;
 
-let current = null;
-export function stop() { if (synth) synth.cancel(); current = null; }
+// 单轨播放器：任何时刻只播"当前"这一句。
+// 有些语音（Edge 在线语音、手机首次朗读）启动要几百毫秒，cancel 之后上一句仍可能"漏"出来。
+// 所以：① 每次朗读都作废旧的请求；② 任何过期的句子一开口就立刻切掉，并补发当前这句。
+let active = null;
+export function stop() { active = null; if (synth) synth.cancel(); }
 
-// 朗读一句，返回 Promise；结束时把用时计入"输入时长"
+function send(req) {
+  if (active !== req || req.done) return;
+  req.cutting = false;
+  const u = new SpeechSynthesisUtterance(req.text);
+  u.lang = LANGS[req.lang].meta.locale;
+  const v = pickVoice(req.lang, req.alt);
+  if (v) u.voice = v;
+  u.rate = req.rate ?? S().settings.ttsRate;
+  u.onstart = () => {
+    if (active !== req) {                       // 过期的句子开口了
+      const cur = active;
+      if (cur) cur.cutting = true;
+      synth.cancel();
+      // cancel 通常会把排在后面的当前句一起清掉：补发（如果它还在队列里就不用）
+      if (cur && !cur.started) setTimeout(() => { if (!synth.pending) send(cur); else cur.cutting = false; }, 90);
+      return;
+    }
+    req.started = true;
+    req.t0 = performance.now();
+  };
+  u.onend = () => { if (active === req && !req.cutting) req.finish(true); };
+  u.onerror = () => { if (active === req && !req.cutting) req.finish(false); };
+  synth.speak(u);
+}
+
+// 朗读一句，返回 Promise<是否完整读完>（被新的朗读打断或超时返回 false）；读完时把用时计入"输入时长"
 export function speak(text, lang, { rate, alt = false, count = true } = {}) {
   return new Promise(resolve => {
-    if (!synth || !text) return resolve();
-    synth.cancel();
-    const u = new SpeechSynthesisUtterance(text);
-    u.lang = LANGS[lang].meta.locale;
-    const v = pickVoice(lang, alt);
-    if (v) u.voice = v;
-    u.rate = rate ?? S().settings.ttsRate;
-    const t0 = performance.now();
-    const done = () => {
-      if (current !== u) return resolve();
-      current = null;
-      if (count) addInput((performance.now() - t0) / 1000);
-      resolve();
+    if (!synth || !text) return resolve(false);
+    if (active) active.finish(false);
+    const req = { text, lang, rate, alt, started: false, done: false, cutting: false, t0: 0 };
+    const begin = performance.now();
+    req.finish = ok => {
+      if (req.done) return;
+      req.done = true;
+      clearInterval(req.poll);
+      if (active === req) active = null;
+      if (ok && req.started && count) addInput((performance.now() - req.t0) / 1000);
+      resolve(ok);
     };
-    u.onend = done; u.onerror = done;
-    current = u;
-    synth.speak(u);
-    // Safari 偶尔不触发 onend：按长度兜底
-    setTimeout(() => { if (current === u && !synth.speaking) done(); }, 400 + text.length * 220);
+    active = req;
+    synth.cancel();
+    setTimeout(() => send(req), 90);             // cancel 之后立刻 speak，Chrome 偶尔会吞掉新的一句
+    req.poll = setInterval(() => {
+      if (active !== req) return req.finish(false);
+      const el = performance.now() - begin;
+      if (req.started && !synth.speaking && !synth.pending && el > 500) req.finish(true);  // Safari 偶尔不触发 onend
+      else if (el > 8000 + text.length * 300) req.finish(false);                            // 兜底
+    }, 200);
   });
 }
 

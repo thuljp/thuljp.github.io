@@ -131,11 +131,13 @@ export function soundsOf(lang) {
       return { ...k, origin: base ? FD.KANA_ORIGIN[base] || '' : '', originNote: FD.ORIGIN_NOTE[k.k] || '', ex: ex ? { w: ex[0], r: ex[1], zh: ex[2], emoji: ex[3] } : null };
     });
   } else {
-    soundCache.fr = [...FD.FR_PHONEMES.map(p => ({ ...p, type: 'p' })), ...FD.FR_RULES.map(r => ({ ...r, type: 'g' }))];
+    soundCache.fr = [...FD.FR_PHONEMES.map(p => ({ ...p, type: 'p', demo: FD.FR_DEMO[p.id][0], demoNote: FD.FR_DEMO[p.id][1] })), ...FD.FR_RULES.map(r => ({ ...r, type: 'g' }))];
   }
   return soundCache[lang];
 }
 export const soundById = (lang, id) => soundsOf(lang).find(x => x.id === id);
+// 单独朗读一个假名时用片假名：发音相同，但语音引擎不会把 は/へ 当成助词读成 wa/e
+export const kanaSpeech = k => String(k).replace(/[\u3041-\u3096]/g, c => String.fromCharCode(c.charCodeAt(0) + 0x60));
 export function counterpart(kanaItem) {   // 平假名 ↔ 片假名
   const other = kanaItem.id.startsWith('h-') ? 'k-' : 'h-';
   return soundsOf('ja').find(x => x.id.startsWith(other) && x.r === kanaItem.r && x.row === kanaItem.row);
@@ -165,8 +167,8 @@ export function cardView(id) {
   if (kind === 's') {
     const s = soundsOf(lang).find(x => x.id === ref);
     if (!s) return null;
-    if (lang === 'ja') return { id, lang, kind, front: s.k, meaning: s.r, tip: s.hint, set: s.set, speak: s.k, big: true, origin: s.origin, kex: s.ex, item: s };
-    if (s.type === 'p') return { id, lang, kind, phoneme: true, item: s, front: '/' + s.ipa + '/', label: s.label, speak: s.words.map(w => w[0]).join(', ') };
+    if (lang === 'ja') return { id, lang, kind, front: s.k, meaning: s.r, tip: s.hint, set: s.set, speak: kanaSpeech(s.k), big: true, origin: s.origin, kex: s.ex, item: s };
+    if (s.type === 'p') return { id, lang, kind, phoneme: true, item: s, front: '/' + s.ipa + '/', label: s.label, speak: s.demo };
     return { id, lang, kind, rule: true, item: s, front: s.q, speak: s.ex.join(', ') };
   }
   if (kind === 'c') {

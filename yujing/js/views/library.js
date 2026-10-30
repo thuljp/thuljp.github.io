@@ -142,7 +142,7 @@ function readingView(el, lang, r) {
     const b = e.currentTarget;
     if (playing) { playing = false; stop(); b.innerHTML = ICON.play + '从头朗读'; return; }
     playing = true; b.innerHTML = ICON.stop + '停止';
-    for (let i = 0; i < r.sentences.length && playing; i++) { await say(i); await new Promise(res => setTimeout(res, 350)); }
+    for (let i = 0; i < r.sentences.length && playing; i++) { if (!(await say(i))) break; await new Promise(res => setTimeout(res, 350)); }
     playing = false; b.innerHTML = ICON.play + '再读一遍';
   };
 }

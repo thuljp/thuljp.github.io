@@ -657,3 +657,6 @@ details summary { cursor: pointer; color: var(--muted); font-size: .9rem; }
 .memo-mine b, .memo-ai b { display: block; font-size: .75rem; color: var(--muted); font-weight: 600; }
 .memo-btns { display: flex; gap: 16px; justify-content: center; }
 .memo-edit textarea { min-height: 64px; }
+.d-demo { margin: 0 0 6px; }
+.d-demo b { font-family: var(--serif-fr); font-size: 1.15rem; color: var(--acc); }
+.d-demo .muted { font-size: .85rem; }

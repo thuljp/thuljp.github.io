@@ -1,7 +1,7 @@
 // 发音全景看板（#/map）与入门课（#/lesson/:id）
 import {
   S, LANGS, UNITS, unitItems, unitState, nextUnit, foundProgress, foundReady, itemStatus, completeUnit, skipUnits,
-  soundsOf, soundById, counterpart, confusables, JA_PAIRS, JA_HOMOPHONE, JA_SKIP,
+  soundsOf, soundById, counterpart, confusables, JA_PAIRS, JA_HOMOPHONE, JA_SKIP, kanaSpeech,
 } from '../store.js';
 import { speak, stop } from '../speech.js';
 import { esc, romaji, shuffle, toast } from '../util.js';
@@ -17,7 +17,8 @@ const unitOfRow = (set, row) => UNITS.ja.find(u => u.set === set && u.rows.inclu
 const unitOfItem = (lang, id) => UNITS[lang].find(u => (lang === 'ja' ? unitItems('ja', u).some(x => x.id === id) : u.items.includes(id)));
 const unitNo = (lang, u) => UNITS[lang].indexOf(u) + 1;
 const shortAnchor = a => String(a || '').split(/[，,（(]/)[0];
-const sayOf = item => (item.k ? item.k : item.type === 'p' ? item.words.map(w => w[0]).join(', ') : item.ex.join(', '));
+// 每个条目"本身"的发音：假名读假名（用片假名读，避免被当成助词）；法语音素读示范；规则读例词
+const sayOf = item => (item.k ? kanaSpeech(item.k) : item.type === 'p' ? item.demo : item.ex.join(', '));
 const sayItem = (lang, item) => speak(sayOf(item), lang, { rate: item.k ? KANA_RATE : undefined, count: false });
 
 // ======================================================================
@@ -170,7 +171,7 @@ export function detailHTML(lang, it) {
   if (lang === 'ja') {
     const cp = counterpart(it);
     const conf = confusables('ja', it.id);
-    return `<div class="d-head"><span class="d-g" lang="ja">${esc(it.k)}</span>${playBtn(it.k, 'ja')}<span class="d-r">${esc(it.r)}</span></div>
+    return `<div class="d-head"><span class="d-g" lang="ja">${esc(it.k)}</span>${playBtn(kanaSpeech(it.k), 'ja')}<span class="d-r">${esc(it.r)}</span></div>
       ${originHTML(it)}
       ${it.hint ? `<p class="d-hint">${esc(it.hint)}</p>` : ''}
       ${exampleHTML(it)}
@@ -201,11 +202,12 @@ function highlightKana(word, k) {
   return i < 0 ? esc(word) : esc(word.slice(0, i)) + '<b>' + esc(k) + '</b>' + esc(word.slice(i + k.length));
 }
 export function phonemeHTML(it) {
-  return `<div class="d-head"><span class="d-g">/${esc(it.ipa)}/</span>${playBtn(it.words.map(w => w[0]).join(', '), 'fr')}<span class="d-r" lang="fr">${esc(it.label)}</span></div>
+  return `<div class="d-head"><span class="d-g">/${esc(it.ipa)}/</span>${playBtn(it.demo, 'fr', { label: '听这个音' })}<span class="d-r" lang="fr">${esc(it.label)}</span></div>
+    <p class="d-demo">单独发音示范：<b lang="fr">${esc(it.demo)}</b><span class="muted">（${esc(it.demoNote)}）</span></p>
     <p class="d-anchor"><b>${esc(it.anchor)}</b></p>
     ${it.mouth ? `<p class="d-hint">${esc(it.mouth)}</p>` : ''}
     <h4>拼写</h4><div class="chips">${it.spell.map(([g, w]) => `<button class="chip" data-say="${esc(w)}" data-lang="fr"><b lang="fr">${esc(g)}</b><span lang="fr">${highlightFr(w, g)}</span></button>`).join('')}</div>
-    <h4>例词</h4><ul class="d-words">${it.words.map(([w, zh]) => `<li>${playBtn(w, 'fr')}<span lang="fr" class="tl">${esc(w)}</span><span class="zh">${esc(zh)}</span></li>`).join('')}</ul>
+    <h4>例词（都含这个音）</h4><ul class="d-words">${it.words.map(([w, zh]) => `<li>${playBtn(w, 'fr')}<span lang="fr" class="tl">${esc(w)}</span><span class="zh">${esc(zh)}</span></li>`).join('')}</ul>
     ${it.pairs?.length ? `<h4>对比听</h4><div class="pairs">${it.pairs.map(([a, b]) => `<div class="pair"><button class="btn small ghost" data-say="${esc(a)}" data-lang="fr">${ICON.play}<span lang="fr">${esc(a)}</span></button><button class="btn small ghost" data-say="${esc(b)}" data-lang="fr">${ICON.play}<span lang="fr">${esc(b)}</span></button></div>`).join('')}</div>` : ''}`;
 }
 export function highlightFr(word, g) {
@@ -214,7 +216,7 @@ export function highlightFr(word, g) {
   return i < 0 ? esc(word) : esc(word.slice(0, i)) + '<b>' + esc(word.slice(i, i + key.length)) + '</b>' + esc(word.slice(i + key.length));
 }
 function compareHTML(items) {
-  return `<h3>长得像，这样区分</h3><div class="cmp-grid">${items.map(it => `<div class="cmp-card"><span class="d-g" lang="ja">${esc(it.k)}</span>${playBtn(it.k, 'ja')}<b>${esc(it.r)}</b>${it.origin ? `<span class="muted">${it.id.startsWith('h-') ? '草书' : '取自'}「<span lang="zh">${esc(it.origin)}</span>」</span>` : ''}${it.hint ? `<small>${esc(it.hint)}</small>` : ''}</div>`).join('')}</div>`;
+  return `<h3>长得像，这样区分</h3><div class="cmp-grid">${items.map(it => `<div class="cmp-card"><span class="d-g" lang="ja">${esc(it.k)}</span>${playBtn(kanaSpeech(it.k), 'ja')}<b>${esc(it.r)}</b>${it.origin ? `<span class="muted">${it.id.startsWith('h-') ? '草书' : '取自'}「<span lang="zh">${esc(it.origin)}</span>」</span>` : ''}${it.hint ? `<small>${esc(it.hint)}</small>` : ''}</div>`).join('')}</div>`;
 }
 
 // ======================================================================
@@ -292,7 +294,7 @@ export function renderLesson(el, lang, unitId) {
     const pairs = unit.pairs ? JA_PAIRS[unit.pairs] : [];
     let table = '';
     if (!unit.contrast) {
-      table = `<div class="rule-table" lang="ja">${items.filter(k => !JA_SKIP.has(k.k)).map(k => `<button class="rt-cell" data-say="${esc(k.k)}" data-lang="ja"><span>${esc(k.k)}</span><small>${esc(k.r)}</small></button>`).join('')}</div>`;
+      table = `<div class="rule-table" lang="ja">${items.filter(k => !JA_SKIP.has(k.k)).map(k => `<button class="rt-cell" data-say="${esc(kanaSpeech(k.k))}" data-lang="ja"><span>${esc(k.k)}</span><small>${esc(k.r)}</small></button>`).join('')}</div>`;
     }
     el.innerHTML = `${top('规则', 10)}
       <div class="learn-card"><h2>${esc(unit.rule.title)}</h2><div class="lesson-text">${unit.rule.body}</div>
@@ -345,11 +347,14 @@ export function renderLesson(el, lang, unitId) {
         if (ok) {
           r.right++;
           if (!q.retry) results.first++;
-          if (q.say) speak(q.say, lang, { rate: lang === 'ja' ? KANA_RATE : 0.9, count: false });
           fb.innerHTML = `<p class="ok-text">对了。${q.after ? esc(q.after) : ''}</p>`;
-          const t = setTimeout(next, q.after ? 1600 : 950);
-          keys = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); clearTimeout(t); next(); } };
-          el.querySelector('.quiz').onclick = e => { if (!e.target.closest('.q-opt')) { clearTimeout(t); next(); } };
+          // 听辨题刚听过，答对不再重播；看字题答对后读一遍，读完再进入下一题（不和下一题的声音叠在一起）
+          let gone = false;
+          const go = () => { if (gone || !document.body.contains(fb)) return; gone = true; next(); };
+          const audio = q.say && !q.listen ? speak(q.say, lang, { rate: lang === 'ja' ? KANA_RATE : 0.9, count: false }) : Promise.resolve();
+          Promise.all([audio, new Promise(r => setTimeout(r, q.after ? 1400 : 800))]).then(go);
+          keys = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); go(); } };
+          el.querySelector('.quiz').onclick = e => { if (!e.target.closest('.q-opt')) go(); };
         } else {
           r.wrong++;
           if (q.say) speak(q.say, lang, { rate: lang === 'ja' ? KANA_RATE : 0.85, count: false });
@@ -436,21 +441,21 @@ function jaItemQuestions(unit, items) {
     const conf = confusables('ja', it.id).filter(x => !JA_SKIP.has(x.k));
     // 听音选字：干扰项优先用易混字和同课的字，不能有同音字
     const ds = pickDistractors(it, [...conf, ...conf, ...pool, ...learned], 3, x => !homophone(x.k, it.k) && x.set === it.set);
-    r1.push({ type: 'listen', item: it.id, listen: true, say: it.k, prompt: '听，选出你听到的假名', big: true, options: shuffle([kanaOpt(it, true), ...ds.map(d => kanaOpt(d, false))]), explain: jaExplain(it) });
+    r1.push({ type: 'listen', item: it.id, listen: true, say: kanaSpeech(it.k), prompt: '听，选出你听到的假名', big: true, options: shuffle([kanaOpt(it, true), ...ds.map(d => kanaOpt(d, false))]), explain: jaExplain(it) });
     // 看字选音
     const dr = pickDistractors(it, wide, 3, x => x.r !== it.r);
-    r2.push({ type: 'read', item: it.id, say: it.k, prompt: `<span lang="ja" class="q-big">${esc(it.k)}</span>读什么？`, options: shuffle([romOpt(it.r, true), ...dr.map(d => romOpt(d.r, false))]), explain: jaExplain(it) });
+    r2.push({ type: 'read', item: it.id, say: kanaSpeech(it.k), prompt: `<span lang="ja" class="q-big">${esc(it.k)}</span>读什么？`, options: shuffle([romOpt(it.r, true), ...dr.map(d => romOpt(d.r, false))]), explain: jaExplain(it) });
     // 片假名：和平假名配对
     if (kata) {
       const h = counterpart(it);
       if (h) {
         const dk = pickDistractors(it, [...conf, ...pool], 3, x => x.r !== it.r);
-        r2.push({ type: 'match', item: it.id, say: it.k, prompt: `平假名 <span lang="ja" class="q-big sm">${esc(h.k)}</span> 的片假名是？`, big: true, options: shuffle([kanaOpt(it, true), ...dk.map(d => kanaOpt(d, false))]), explain: jaExplain(it) });
+        r2.push({ type: 'match', item: it.id, say: kanaSpeech(it.k), prompt: `平假名 <span lang="ja" class="q-big sm">${esc(h.k)}</span> 的片假名是？`, big: true, options: shuffle([kanaOpt(it, true), ...dk.map(d => kanaOpt(d, false))]), explain: jaExplain(it) });
       }
     }
     // 易混字专项
     const confIn = conf.filter(x => wide.some(w => w.id === x.id));
-    if (confIn.length) r2.push({ type: 'confuse', item: it.id, say: it.k, prompt: `哪个读 <b class="or">${esc(it.r)}</b>？`, big: true, options: shuffle([kanaOpt(it, true), ...confIn.slice(0, 2).map(d => kanaOpt(d, false))]), explain: jaExplain(it) + `<p class="d-hint">和 ${confIn.map(x => `<span lang="ja">${esc(x.k)}</span>（${esc(x.r)}）`).join('、')} 长得像。</p>` });
+    if (confIn.length) r2.push({ type: 'confuse', item: it.id, say: kanaSpeech(it.k), prompt: `哪个读 <b class="or">${esc(it.r)}</b>？`, big: true, options: shuffle([kanaOpt(it, true), ...confIn.slice(0, 2).map(d => kanaOpt(d, false))]), explain: jaExplain(it) + `<p class="d-hint">和 ${confIn.map(x => `<span lang="ja">${esc(x.k)}</span>（${esc(x.r)}）`).join('、')} 长得像。</p>` });
   }
   return [...shuffle(r1), ...spread(shuffle(r2))];
 }
@@ -485,10 +490,10 @@ function jaRuleQuestions(unit, items) {
     const near = pool.filter(x => x.k[0] === it.k[0] || x.r.slice(-1) === it.r.slice(-1) || x.k.slice(1) === it.k.slice(1));
     if (i % 2 === 0) {
       const ds = pickDistractors(it, [...(base ? [base, base] : []), ...near, ...pool], 3, x => !homophone(x.k, it.k) && x.r !== it.r);
-      qs.push({ type: 'listen', item: it.id, listen: true, say: it.k, prompt: '听，选出你听到的', big: true, options: shuffle([kanaOpt(it, true), ...ds.map(d => kanaOpt(d, false))]), explain: jaExplain(it) + (base ? `<p class="d-hint"><span lang="ja">${esc(base.k)}</span>（${esc(base.r)}）加 ゛゜ → <span lang="ja">${esc(it.k)}</span>（${esc(it.r)}）</p>` : '') });
+      qs.push({ type: 'listen', item: it.id, listen: true, say: kanaSpeech(it.k), prompt: '听，选出你听到的', big: true, options: shuffle([kanaOpt(it, true), ...ds.map(d => kanaOpt(d, false))]), explain: jaExplain(it) + (base ? `<p class="d-hint"><span lang="ja">${esc(base.k)}</span>（${esc(base.r)}）加 ゛゜ → <span lang="ja">${esc(it.k)}</span>（${esc(it.r)}）</p>` : '') });
     } else {
       const ds = pickDistractors(it, [...near, ...pool, ...(base ? [base] : [])], 3, x => x.r !== it.r);
-      qs.push({ type: 'read', item: it.id, say: it.k, prompt: `<span lang="ja" class="q-big">${esc(it.k)}</span>读什么？`, options: shuffle([romOpt(it.r, true), ...ds.map(d => romOpt(d.r, false))]), explain: jaExplain(it) });
+      qs.push({ type: 'read', item: it.id, say: kanaSpeech(it.k), prompt: `<span lang="ja" class="q-big">${esc(it.k)}</span>读什么？`, options: shuffle([romOpt(it.r, true), ...ds.map(d => romOpt(d.r, false))]), explain: jaExplain(it) });
     }
   });
   const pairs = unit.pairs ? pairQuestions(JA_PAIRS[unit.pairs], 3) : [];
