@@ -34,7 +34,8 @@ const COLLS = ["jobs","events","materials","qa","meta"];
 function makeStore(c){
   const api = `https://api.github.com/repos/${encodeURIComponent(c.owner)}/${encodeURIComponent(c.repo)}/contents/${c.path.split("/").map(encodeURIComponent).join("/")}`;
   const H = {Authorization:"Bearer " + c.token, Accept:"application/vnd.github+json", "X-GitHub-Api-Version":"2022-11-28"};
-  let data = empty(), sha = null, etag = null;
+  let data = empty(), sha = null, etag = null, knownJobs = 0;
+  const jobCount = d => Object.keys((d && d.jobs) || {}).length;
   const pending = new Set(); const subs = {}; let timer = null, flushing = null, retryTimer = null;
   function empty(){ const d = {version:1}; COLLS.forEach(k => d[k] = {}); return d; }
   function norm(d){ const o = d && typeof d === "object" ? d : {}; COLLS.forEach(k => { if(!o[k] || typeof o[k] !== "object") o[k] = {}; }); return o; }
@@ -50,7 +51,8 @@ function makeStore(c){
     if(j.content && j.encoding === "base64") text = b64dec(j.content);
     else { const raw = await fetch(`${api}?ref=${encodeURIComponent(c.branch)}`, {headers:{...H, Accept:"application/vnd.github.raw"}, cache:"no-store"}); if(!raw.ok) throw {code:"http", status:raw.status}; text = await raw.text(); }
     let parsed; try { parsed = JSON.parse(text || "{}"); } catch { throw {code:"corrupt", message:"desk.json 不是有效的 JSON"}; }
-    return {status:200, sha:j.sha, etag:tag, data:norm(parsed)};
+    const out = norm(parsed); knownJobs = Math.max(knownJobs, jobCount(out));
+    return {status:200, sha:j.sha, etag:tag, data:out};
   }
   function live(coll){ return Object.entries(data[coll] || {}).filter(([, v]) => v && !v._deleted); }
   function emit(coll, changes, force){ if((changes.length || force) && subs[coll]) subs[coll]({docChanges:() => changes.map(([type, id, d]) => ({type, doc:{id, exists:true, data:() => d}})), metadata:{fromCache:false, hasPendingWrites:false}}); }
@@ -80,17 +82,26 @@ function makeStore(c){
         const mine = new Set(pending); pending.clear();
         setStatus("保存中…", "busy");
         try {
-          const body = JSON.stringify(prune(data));
+          const next = prune(data);
+          // Safety: a normal edit never removes records (deletions are kept as markers for 30 days),
+          // so a save that would drop many of them means something went wrong. Refuse it.
+          if(knownJobs >= 10 && jobCount(next) < knownJobs * 0.8){
+            mine.forEach(k => pending.add(k));
+            setStatus("为保护数据，这次没有保存：要保存的职位比 GitHub 上少很多。请刷新页面。", "err");
+            break;
+          }
+          const body = JSON.stringify(next);
           if(body.length > 950000) setStatus("数据接近 1MB 上限，建议清理旧职位", "warn");
           const res = await put(body, `desk: 更新 ${mine.size} 项`);
           if(res.conflict){
             const remote = await getRemote(false);
-            const merged = remote.status === 200 ? remote.data : empty();
+            if(remote.status !== 200) throw {code:"http", status:remote.status, message:"GitHub 上找不到数据文件"};
+            const merged = remote.data;
             for(const key of mine){ const [coll, id] = key.split("/"); merged[coll][id] = data[coll][id]; }
             diffInto(merged, mine); data = merged; sha = remote.sha || null; etag = null;
             mine.forEach(k => pending.add(k)); continue;
           }
-          sha = res.sha || sha; etag = null; setStatus(`已同步 ${hhmm()}`, "ok");
+          sha = res.sha || sha; etag = null; knownJobs = Math.max(knownJobs, jobCount(next)); setStatus(`已同步 ${hhmm()}`, "ok");
         } catch(e){
           mine.forEach(k => pending.add(k));
           setStatus(e && e.code === "auth" ? "GitHub 拒绝写入：检查令牌权限" : "保存失败，稍后自动重试", "err");
@@ -125,13 +136,44 @@ function makeStore(c){
     doc(path){
       const [coll, id] = path.split("/");
       return {
-        async set(v){ const d = JSON.parse(JSON.stringify(v)); if(coll === "jobs" && typeof d.full === "string" && d.full.length > 6000) d.full = d.full.slice(0, 6000);
+        async set(v){ const d = JSON.parse(JSON.stringify(v)); if(coll === "jobs" && typeof d.full === "string" && d.full.length > 4000) d.full = d.full.slice(0, 4000);
           d._u = Date.now(); data[coll][id] = d; pending.add(coll + "/" + id); schedule(); },
         async delete(){ data[coll][id] = {_deleted:true, _u:Date.now()}; pending.add(coll + "/" + id); schedule(); },
       };
     },
     flushNow: flush, snapshot: () => JSON.parse(JSON.stringify(data)),
+    /* Versions of desk.json kept by git: every save is a commit, so any earlier state can be brought back */
+    async history(){
+      const base = `https://api.github.com/repos/${encodeURIComponent(c.owner)}/${encodeURIComponent(c.repo)}`;
+      const r = await fetch(`${base}/commits?path=${encodeURIComponent(c.path)}&sha=${encodeURIComponent(c.branch)}&per_page=40`, {headers:H, cache:"no-store"});
+      if(!r.ok) throw {code:"http", status:r.status};
+      return (await r.json()).map(x => ({sha:x.sha, at:x.commit.committer.date, msg:x.commit.message.split("\n")[0]}));
+    },
+    async version(ref){
+      const r = await fetch(`${api}?ref=${encodeURIComponent(ref)}`, {headers:{...H, Accept:"application/vnd.github.raw"}, cache:"no-store"});
+      if(!r.ok) throw {code:"http", status:r.status};
+      return norm(JSON.parse(await r.text()));
+    },
+    async restore(ref){
+      const old = await store.version(ref);
+      const cur = await getRemote(false); sha = cur.sha || sha;
+      const res = await put(JSON.stringify({...old, updatedAt:new Date().toISOString()}), `desk: 恢复到 ${ref.slice(0, 7)} 的版本`);
+      if(res.conflict) throw {code:"conflict"};
+      sha = res.sha; diffInto(old); data = old; knownJobs = jobCount(old); setStatus(`已恢复 ${hhmm()}`, "ok");
+    },
+    /* Full posting texts saved by the daily search in texts/<date>.json (kept out of desk.json so it stays small) */
+    async text(ref, id){
+      textCache[ref] ||= (async () => {
+        const dir = c.path.includes("/") ? c.path.replace(/[^/]+$/, "") : "";
+        const r = await fetch(`https://api.github.com/repos/${encodeURIComponent(c.owner)}/${encodeURIComponent(c.repo)}/contents/${(dir + ref).split("/").map(encodeURIComponent).join("/")}?ref=${encodeURIComponent(c.branch)}`,
+          {headers:{...H, Accept:"application/vnd.github.raw"}, cache:"no-store"});
+        if(!r.ok) throw {code:"http", status:r.status};
+        return JSON.parse(await r.text());
+      })().catch(e => { delete textCache[ref]; throw e; });
+      return ((await textCache[ref]) || {})[id] || "";
+    },
   };
+  const textCache = {};
   return store;
 }
 
@@ -279,7 +321,7 @@ window.__showSetup = function(fromPrefs){
 window.__ghPanel = function(){
   return `<section class="panel pad"><h2 class="ph">连接</h2>
     <p class="hint" style="margin:0 0 10px">数据保存在 GitHub 私有仓库 <b>${esc(cfg.owner)}/${esc(cfg.repo)}</b> 的 ${esc(cfg.path)}；AI 功能使用 DeepSeek（${cfg.dsKey ? esc(cfg.dsModel) : "未设置密钥"}）。同步状态：${esc(statusText || "—")}</p>
-    <button class="btn" type="button" onclick="window.__showSetup(true)">修改连接设置</button></section>`;
+    <div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn" type="button" onclick="window.__showSetup(true)">修改连接设置</button><button class="btn" type="button" data-history>数据历史与恢复</button></div></section>`;
 };
 document.addEventListener("DOMContentLoaded", () => setStatus(statusText, statusKind));
 })();
@@ -661,6 +703,14 @@ dialog::backdrop{background:rgba(10,16,22,.42)}
 .setup{display:flex; flex-direction:column; gap:12px; max-width:720px}
 .setup input[type=password]{width:100%; border:1px solid var(--line); background:var(--surface); color:var(--ink); border-radius:var(--r); padding:7px 9px}
 .setup input[type=password]:focus{outline:2px solid var(--accent); outline-offset:-1px; border-color:transparent}
+.dnav{display:flex; align-items:center; gap:4px}
+.triagebar{display:flex; flex-wrap:wrap; gap:6px 12px; align-items:center; justify-content:space-between; padding:10px 16px; background:var(--accent-soft); border-bottom:1px solid var(--line)}
+.triagebar > span:first-child{font-weight:600}
+.triagebar .hint{flex-basis:100%}
+.hist-row{display:grid; grid-template-columns:minmax(0,1fr) auto; gap:10px; align-items:center; padding:9px 12px; border-top:1px solid var(--line)}
+.hist-row:first-child{border-top:0}
+.hist-row .t1{font-weight:600} .hist-row .t2{font-size:12.5px; color:var(--muted)}
+#job-due{width:auto}
 .toast{position:fixed; left:max(16px,env(safe-area-inset-left,0px)); bottom:calc(16px + env(safe-area-inset-bottom,0px)); z-index:40; background:var(--ink); color:var(--surface); padding:10px 14px; border-radius:var(--r); box-shadow:var(--shadow); max-width:calc(100% - 32px)}
 .status-line{color:var(--muted); font-size:12.5px}
 
@@ -787,7 +837,7 @@ const LOCAL_TZ = (() => { try { return Intl.DateTimeFormat().resolvedOptions().t
 /* ---------- State ---------- */
 const S = { db:null, jobs:new Map(), events:new Map(), mats:new Map(), qa:new Map(), meta:new Map(),
   loaded:{jobs:false,events:false,mats:false,qa:false,meta:false}, view:"overview",
-  jobFilter:{q:"", status:"active", sort:"deadline", tag:"", onlyNew:false}, calPast:false, calDeadlines:true,
+  jobFilter:{q:"", status:"active", sort:"deadline", tag:"", onlyNew:false, due:""}, calPast:false, calDeadlines:true,
   qaCat:"全部", drawerJob:null, downloads:null, denied:false, sel:new Set(),
   jobView: lsGet("jd-jobview") || "list", calMode: lsGet("jd-calmode") || "month", calMonth:"", calDay:"" };
 function lsGet(k){ try { return localStorage.getItem(k); } catch { return null; } }
@@ -897,8 +947,24 @@ window.addEventListener("hashchange", () => setView(location.hash.slice(1)));
 
 /* ---------- Render ---------- */
 function allLoaded(){ return Object.values(S.loaded).every(Boolean); }
-function render(){
+/* Chinese/Japanese input: while the IME is composing, rebuilding the page would cut the composition off */
+let COMPOSING = false, RENDER_PENDING = false;
+document.addEventListener("compositionstart", () => { COMPOSING = true; }, true);
+document.addEventListener("compositionend", e => {
+  COMPOSING = false;
+  const t = e.target;
+  if(t && t.id === "job-q"){ S.jobFilter.q = t.value; updateJobsBody(); }
+  else if(t && t.id === "imp-q" && IMP){ IMP.q = t.value; IMP.limit = 300; renderImport(); }
+  if(RENDER_PENDING){ RENDER_PENDING = false; render(true); }
+}, true);
+document.addEventListener("focusout", () => { if(RENDER_PENDING && !COMPOSING) setTimeout(() => { if(RENDER_PENDING && !isTyping()){ RENDER_PENDING = false; render(true); } }, 0); }, true);
+function isTyping(){ const a = document.activeElement; return !!(a && $("#main").contains(a) && (a.tagName === "TEXTAREA" || (a.tagName === "INPUT" && /^(text|search|url|email|)$/.test(a.type)))); }
+/* background = the re-render comes from sync, not from something the user just did */
+function render(background){
   const main = $("#main");
+  if(COMPOSING){ RENDER_PENDING = true; return; }
+  if(background && S.view === "jobs" && document.activeElement && document.activeElement.id === "job-q"){ updateJobsBody(); return; }
+  if(background && isTyping()){ RENDER_PENDING = true; return; }
   if(S.denied){ main.innerHTML = `<div class="empty"><strong>这个页面的数据只对所有者开放。</strong>如果你是所有者，请登录后重新打开。</div>`; return; }
   if(!S.db || !allLoaded()){ return; }
   const html = ({overview:vOverview, jobs:vJobs, calendar:vCalendar, materials:vMaterials, prep:vPrep, prefs:vPrefs})[S.view]();
@@ -961,8 +1027,18 @@ function isNewJob(id, j){
   const lr = lastRunIds(); if(lr.ids.has(id)) return true;
   const n = j.foundAt ? daysUntil(j.foundAt) : null; return n !== null && n >= -1;
 }
+const _T2S = "門门學学濟济經经會会業业與与財财務务計计際际貿贸華华東东廣广興兴傳传關关開开發发國国師师範范職职請请專专員员書书長长總总達达遠远島岛灣湾臺台蘇苏陽阳漢汉統统區区鄉乡體体處处實实驗验檢检環环資资產产價价製制劃划圖图館馆醫医藥药農农礦矿電电網网絡络數数據据雲云機机構构創创設设選选導导論论歷历個个們们這这對对應应從从來来時时間间點点線线類类審审評评復复號号碼码頁页錄录歡欢誠诚聯联繫系廳厅嶺岭齊齐魯鲁晉晋豐丰慶庆澤泽濱滨葉叶劉刘陳陈黃黄張张鄭郑趙赵";
+const T2S = {}; for(let i = 0; i < _T2S.length; i += 2) T2S[_T2S[i]] = _T2S[i + 1];
+function normText(t){ return String(t || "").toLowerCase().replace(/[\u3400-\u9fff]/g, ch => T2S[ch] || ch); }
+const DUE_OPTS = [["","所有截止时间"],["7","7 天内截止"],["14","14 天内截止"],["30","30 天内截止"],["open","长期或未定"],["past","已过截止"]];
+function dueMatch(j, due){
+  if(!due) return true; const n = daysUntil(j.deadline);
+  if(due === "open") return n === null;
+  if(due === "past") return n !== null && n < 0;
+  return n !== null && n >= 0 && n <= +due;
+}
 function filteredJobs(ignoreStatus){
-  const f = S.jobFilter; const q = f.q.trim().toLowerCase(); const lr = lastRunIds();
+  const f = S.jobFilter; const terms = normText(f.q).split(/\s+/).filter(Boolean); const lr = lastRunIds();
   let list = [...S.jobs.entries()].filter(([id,j]) => {
     const st = j.status || "watch";
     if(!ignoreStatus){
@@ -971,14 +1047,16 @@ function filteredJobs(ignoreStatus){
     }
     if(f.tag && !(j.tags || []).includes(f.tag)) return false;
     if(f.onlyNew && !(lr.ids.has(id) || (lr.date && j.foundAt === lr.date))) return false;
-    if(q){ const hay = [j.inst,j.alias,j.dept,j.title,j.city,j.loc,j.jel,j.kw,j.notes,j.sheetNote,j.section,j.jobType,j.srcType,j.talentPlan,(j.tags||[]).join(" ")].join(" ").toLowerCase(); if(!hay.includes(q)) return false; }
+    if(!dueMatch(j, f.due)) return false;
+    if(terms.length){ const hay = normText([j.inst,j.alias,j.dept,j.title,j.city,j.loc,j.jel,j.kw,j.notes,j.sheetNote,j.section,j.jobType,j.srcType,j.talentPlan,j.contact,(j.tags||[]).join(" ")].join(" ")); if(!terms.every(t => hay.includes(t))) return false; }
     return true;
   });
   if(f.sort === "deadline") list.sort((a,b) => { const da = daysUntil(a[1].deadline), db = daysUntil(b[1].deadline);
       const ka = da === null ? 1e6 : da < 0 ? 5e5 - da : da, kb = db === null ? 1e6 : db < 0 ? 5e5 - db : db; return ka - kb; });
   if(f.sort === "prio") list.sort((a,b) => (b[1].prio||0) - (a[1].prio||0) || byDeadline(a,b));
   if(f.sort === "updated") list.sort((a,b) => (b[1].updatedAt||"").localeCompare(a[1].updatedAt||""));
-  if(f.sort === "name") list.sort((a,b) => jobName(a[1]).localeCompare(jobName(b[1])));
+  if(f.sort === "name") list.sort((a,b) => jobName(a[1]).localeCompare(jobName(b[1]), "zh-CN"));
+  if(f.sort === "found") list.sort((a,b) => (b[1].foundAt || (b[1].createdAt||"").slice(0,10)).localeCompare(a[1].foundAt || (a[1].createdAt||"").slice(0,10)) || byDeadline(a,b));
   return list;
 }
 function badges(id, j){ return (isNewJob(id, j) ? '<span class="newmini">新</span>' : "") + (j.tags || []).map(t => `<span class="tagmini">${esc(t)}</span>`).join(""); }
@@ -994,18 +1072,32 @@ function vJobs(){
   for(const id of [...S.sel]) if(!S.jobs.has(id)) S.sel.delete(id);
   const opts = [["active","进行中（不含已拒和不申请）"],["all","全部状态"],...STATUSES.map(s => [s.k, s.l])];
   const head = `
-    <div class="view-head"><div><h1>职位</h1><p>${S.jobs.size} 个职位，当前显示 ${list.length} 个</p></div>
+    <div class="view-head"><div><h1>职位</h1><p id="jobs-count">${S.jobs.size} 个职位，当前显示 ${list.length} 个</p></div>
       <div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn" type="button" data-import>导入表格</button><button class="btn" type="button" data-new-job>手动添加</button><button class="btn primary" type="button" data-parse>识别招聘信息</button></div></div>
     <div class="toolbar">
       <div class="seg" role="group" aria-label="显示方式"><button type="button" data-jobview="list" aria-pressed="${!kb}">列表</button><button type="button" data-jobview="board" aria-pressed="${kb}">看板</button></div>
-      <input type="search" id="job-q" placeholder="搜索学校、城市、标签、笔记" value="${esc(f.q)}" aria-label="搜索职位">
+      <input type="search" id="job-q" placeholder="搜索学校、城市、方向；多个词用空格分开" value="${esc(f.q)}" aria-label="搜索职位" autocomplete="off">
+      <select id="job-due" aria-label="按截止时间筛选">${DUE_OPTS.map(([k,l]) => `<option value="${k}"${(f.due||"")===k?" selected":""}>${l}</option>`).join("")}</select>
       ${kb ? "" : `<select id="job-status" aria-label="按状态筛选">${opts.map(([k,l]) => `<option value="${k}"${f.status===k?" selected":""}>${esc(l)}</option>`).join("")}</select>`}
       ${TAGS.length ? `<select id="job-tag" aria-label="按标签筛选"><option value="">所有标签</option>${TAGS.map(t => `<option${f.tag===t?" selected":""}>${esc(t)}</option>`).join("")}</select>` : ""}
-      ${kb ? "" : `<select id="job-sort" aria-label="排序">${[["deadline","按截止日期"],["prio","按优先级"],["updated","按最近修改"],["name","按学校名"]].map(([k,l]) => `<option value="${k}"${f.sort===k?" selected":""}>${l}</option>`).join("")}</select>`}
+      ${kb ? "" : `<select id="job-sort" aria-label="排序">${[["deadline","按截止日期"],["found","按发现时间（新的在前）"],["prio","按优先级"],["updated","按最近修改"],["name","按学校名"]].map(([k,l]) => `<option value="${k}"${f.sort===k?" selected":""}>${l}</option>`).join("")}</select>`}
       ${f.onlyNew ? `<button class="chip" type="button" data-clear-new aria-pressed="true">只看最近一次检索新增 ✕</button>` : ""}
+      ${(f.q || f.due || f.tag) ? `<button class="btn ghost sm" type="button" data-clear-filters>清除筛选</button>` : ""}
     </div>`;
   if(!S.jobs.size) return head + `<div class="panel"><div class="empty"><strong>还没有职位</strong>导入表格、识别招聘信息或手动添加。<br><button class="btn primary" type="button" data-import>导入表格</button></div></div>`;
-  if(kb) return head + vBoard(list);
+  return head + `<div id="jobs-body">${kb ? vBoard(list) : jobsListHtml(list)}</div>`;
+}
+/* Refresh only the results under the toolbar, so the search box (and an IME composition in it) is left alone */
+function updateJobsBody(){
+  const body = $("#jobs-body"); if(S.view !== "jobs" || !body){ render(); return; }
+  const tpl = document.createElement("template"); tpl.innerHTML = vJobs();
+  const nb = tpl.content.querySelector("#jobs-body"), nc = tpl.content.querySelector("#jobs-count");
+  if(nb) body.replaceWith(nb); const cnt = $("#jobs-count"); if(cnt && nc) cnt.textContent = nc.textContent;
+  const clr = tpl.content.querySelector("[data-clear-filters]"), oldClr = $("[data-clear-filters]");
+  if(!!clr !== !!oldClr){ const tb = $(".toolbar"); if(clr && tb) tb.appendChild(clr); if(!clr && oldClr) oldClr.remove(); }
+}
+function jobsListHtml(list){
+  const f = S.jobFilter;
   const allSel = list.length && list.every(([id]) => S.sel.has(id));
   const rows = list.map(([id,j]) => `
     <tr data-open-job="${esc(id)}" tabindex="0"${S.sel.has(id) ? ' class="selected"' : ""}>
@@ -1016,10 +1108,10 @@ function vJobs(){
       <td class="c-mat">${meterHtml(j)}</td>
       <td class="c-prio">${stars(j.prio) || '<span class="sub">—</span>'}</td>
     </tr>`).join("");
-  return head + `
+  return `
     <div class="panel" style="overflow-x:auto">
       ${list.length ? `<table class="jobs-table"><thead><tr><th class="selcell"><input type="checkbox" id="sel-all"${allSel ? " checked" : ""} aria-label="全选当前列表"></th><th>截止</th><th>学校 / 职位</th><th>状态</th><th>材料</th><th>优先级</th></tr></thead><tbody>${rows}</tbody></table>`
-        : `<div class="empty">没有符合筛选条件的职位。</div>`}
+        : `<div class="empty">没有符合筛选条件的职位。${(f.q || f.due || f.tag || f.status !== "active") ? `<br><button class="btn" type="button" data-clear-filters>清除筛选</button>` : ""}</div>`}
     </div>
     ${S.sel.size ? `<div class="bulkbar" role="region" aria-label="批量操作">
       <b>已选 ${S.sel.size} 个</b>
@@ -1278,7 +1370,22 @@ function savePref(field, raw){
 }
 
 /* ---------- Drawer: one job ---------- */
-function openJob(id){ S.drawerJob = id; renderDrawer(true); }
+function openJob(id, keepList){
+  if(!keepList) S.drawerList = S.view === "jobs" ? filteredJobs(S.jobView === "board").map(x => x[0]) : [id];
+  if(!S.drawerList || !S.drawerList.includes(id)) S.drawerList = [id];
+  S.drawerJob = id; renderDrawer(true);
+}
+function drawerStep(k){
+  const L = S.drawerList || []; const i = L.indexOf(S.drawerJob); if(i < 0) return;
+  const n = L[i + k]; if(n && S.jobs.has(n)){ flushAll(); openJob(n, true); }
+}
+function triageAndNext(st){
+  const id = S.drawerJob; if(!id) return;
+  patch("jobs", id, {status:st}); toast(st === "watch" ? "已移到“待定”" : st === "prep" ? "已移到“准备中”" : "已标记为不申请");
+  const L = S.drawerList || []; const i = L.indexOf(id);
+  const next = L.slice(i + 1).find(x => S.jobs.has(x) && (S.jobs.get(x).status || "watch") === "inbox") || L.slice(i + 1).find(x => S.jobs.has(x));
+  render(); if(next) openJob(next, true); else { closeDrawer(); toast("这一批看完了"); }
+}
 function closeDrawer(){ flushAll(); S.drawerJob = null; $("#drawer-root").innerHTML = ""; render(); }
 function renderDrawer(first){
   const root = $("#drawer-root"); const id = S.drawerJob; const j = S.jobs.get(id);
@@ -1292,8 +1399,10 @@ function renderDrawer(first){
   root.innerHTML = `
     <div class="scrim" data-close-drawer></div>
     <aside class="drawer" role="dialog" aria-modal="true" aria-label="${esc(jobName(j))}">
-      <div class="drawer-head"><span class="crumb">${esc(j.srcType || (j.source === "joe" ? "JOE" : j.source === "sheet" ? "表格导入" : "手动添加"))}${j.updatedAt ? " · 修改于 " + esc(fmtDate(j.updatedAt.slice(0,10),false)) : ""}</span>
-        <button class="btn ghost" type="button" data-close-drawer aria-label="关闭">关闭</button></div>
+      <div class="drawer-head"><span class="crumb">${esc(j.srcType || (j.source === "joe" ? "JOE" : j.source === "sheet" ? "表格导入" : "手动添加"))}${j.foundAt ? " · 发现于 " + esc(fmtDate(j.foundAt,false)) : ""}</span>
+        <span class="dnav">${(S.drawerList || []).length > 1 ? `<button class="btn ghost sm" type="button" data-dstep="-1" aria-label="上一个"${(S.drawerList.indexOf(id) <= 0) ? " disabled" : ""}>‹</button><span class="status-line">${S.drawerList.indexOf(id) + 1} / ${S.drawerList.length}</span><button class="btn ghost sm" type="button" data-dstep="1" aria-label="下一个"${S.drawerList.indexOf(id) >= S.drawerList.length - 1 ? " disabled" : ""}>›</button>` : ""}
+        <button class="btn ghost" type="button" data-close-drawer aria-label="关闭">关闭</button></span></div>
+      ${(j.status || "watch") === "inbox" ? `<div class="triagebar"><span>这个职位还没筛选</span><span style="display:flex;gap:6px;flex-wrap:wrap"><button class="btn sm primary" type="button" data-dtriage="watch" title="快捷键 A">关注</button><button class="btn sm" type="button" data-dtriage="prep" title="快捷键 P">准备申请</button><button class="btn sm" type="button" data-dtriage="skip" title="快捷键 S">不申请</button></span><span class="hint" style="margin:0">看完自动跳到下一个。快捷键：A 关注 · P 准备申请 · S 不申请 · ← → 切换</span></div>` : ""}
       <div class="drawer-body">
         <div>
           <input class="big-input" type="text" id="j-inst" data-jf="inst" value="${esc(j.inst)}" placeholder="学校或机构" aria-label="学校或机构">
@@ -1337,7 +1446,7 @@ function renderDrawer(first){
           ${mats.length ? `<div class="minilist">${mats.map(([mid,m]) => `<div class="miniitem" data-edit-mat="${esc(mid)}" tabindex="0"><b>${esc(m.kind)}：${esc(m.label || "未命名")}</b><span>${esc(m.date ? fmtDate(m.date,false) : "")}</span></div>`).join("")}</div>` : `<p class="hint" style="margin:0">还没有记录发给这个学校的材料版本。</p>`}
         </div>
         ${(j.section || j.loc || j.jel || j.kw) ? `<div class="metaline">${j.section ? `<span>${esc(j.section)}</span>` : ""}${j.loc ? `<span>${esc(j.loc)}</span>` : ""}${j.jel ? `<span>JEL：${esc(j.jel)}</span>` : ""}${j.kw ? `<span>方向：${esc(j.kw)}</span>` : ""}</div>` : ""}
-        ${j.full ? `<details><summary class="sec-title" style="display:inline">招聘原文</summary><div class="fulltext">${esc(j.full)}</div></details>` : ""}
+        ${j.full ? `<details><summary class="sec-title" style="display:inline">招聘原文</summary><div class="fulltext">${esc(j.full)}</div></details>` : j.textRef ? `<details data-lazy-text="${esc(id)}"><summary class="sec-title" style="display:inline">招聘原文</summary><div class="fulltext">正在读取…</div></details>` : ""}
         <div style="border-top:1px solid var(--line);padding-top:16px;display:flex;gap:8px;flex-wrap:wrap">${S.sample ? `<button class="btn" type="button" data-ai-job="${esc(id)}">问 AI 关于这个职位</button>` : ""}<button class="btn danger" type="button" data-del-job>删除这个职位</button></div>
       </div>
     </aside>`;
@@ -1923,9 +2032,10 @@ function aiTools(){
   const note = t => aiNote(t);
   return [
     {name:"get_job", description:"读取一个职位的完整信息：招聘原文摘要、材料清单及完成情况、笔记、待遇、考核、联系方式、链接。参数 id 来自数据列表第一列。", inputSchema:{type:"object", properties:{id:{type:"string"}}, required:["id"]},
-      execute:({id}) => { const j = S.jobs.get(String(id)); if(!j) throw new Error("没有这个 id"); note(`查看了 ${jobName(j)}`);
+      execute:async ({id}) => { const j = S.jobs.get(String(id)); if(!j) throw new Error("没有这个 id"); note(`查看了 ${jobName(j)}`);
+        const fullText = j.full || (j.textRef && S.db && S.db.text ? await S.db.text(j.textRef, String(id)).catch(() => "") : "");
         const req = Object.fromEntries(MATS.filter(m => (j.req||{})[m.k]).map(m => [m.l, j.req[m.k] === 2 ? "已完成" : "未完成"]));
-        return {...jobOut(id, j), 优先级:j.prio||0, 标签:j.tags||[], 岗位类型:j.jobType||"", 申请方式:j.portal||"", 招聘页:j.url||"", 申请入口:j.applyUrl||"", 联系方式:j.contact||"", 人才计划:j.talentPlan||"", 待遇:j.pay||"", 考核:j.assess||"", 方向:j.kw||"", 材料清单:req, 调研笔记:(j.notes||"").slice(0,3000), 表格备注:(j.sheetNote||"").slice(0,1500), 招聘原文:(j.full||"").slice(0,5000)}; }},
+        return {...jobOut(id, j), 优先级:j.prio||0, 标签:j.tags||[], 岗位类型:j.jobType||"", 申请方式:j.portal||"", 招聘页:j.url||"", 申请入口:j.applyUrl||"", 联系方式:j.contact||"", 人才计划:j.talentPlan||"", 待遇:j.pay||"", 考核:j.assess||"", 方向:j.kw||"", 材料清单:req, 调研笔记:(j.notes||"").slice(0,3000), 表格备注:(j.sheetNote||"").slice(0,1500), 招聘原文:(fullText||"").slice(0,5000)}; }},
     {name:"find_jobs", description:"按关键词、状态或截止天数筛选职位，返回最多 40 条摘要。status 用英文状态码；within_days 表示截止在多少天内。", inputSchema:{type:"object", properties:{query:{type:"string"}, status:{type:"string"}, within_days:{type:"number"}}},
       execute:({query, status, within_days}) => { const q = String(query||"").toLowerCase();
         return [...S.jobs.entries()].filter(([,j]) => (!status || (j.status||"watch") === status) && (!q || [j.inst,j.alias,j.dept,j.title,j.city,j.kw,j.notes,(j.tags||[]).join(" ")].join(" ").toLowerCase().includes(q))
@@ -2032,6 +2142,40 @@ function undoAI(i){
   m.undo = 0; m.notes = [...(m.notes || []), "已撤销这次的修改"]; refresh(); drawAI(); toast("已撤销");
 }
 
+/* ---------- Data history (every save is a git commit) ---------- */
+async function historyDialog(){
+  if(!S.db || !S.db.history){ toast("这个版本的页面不支持查看历史。"); return; }
+  openDlg(`<div class="dlg-head"><h2>数据历史与恢复</h2><button class="btn ghost" type="button" data-close-dlg>关闭</button></div>
+    <div class="dlg-body" id="hist-body"><p class="hint" style="margin:0">每次保存都会在 GitHub 上留下一个版本，下面是最近 40 个。恢复会把那个版本另存为最新版本，现在的版本仍然保留在历史里，随时可以再恢复回来。</p><div class="empty">正在读取…</div></div>`, true);
+  let list; try { list = await S.db.history(); } catch(e){ $("#hist-body .empty").textContent = "读取历史失败，检查网络或令牌后再试。"; return; }
+  const cur = S.jobs.size;
+  $("#hist-body").innerHTML = `<p class="hint" style="margin:0">每次保存都会在 GitHub 上留下一个版本，下面是最近 ${list.length} 个。恢复会把那个版本另存为最新版本，现在的版本仍然保留在历史里，随时可以再恢复回来。现在有 ${cur} 个职位。</p>
+    <div class="imp-list" style="max-height:58vh">${list.map((v, i) => `<div class="hist-row" data-ver="${esc(v.sha)}">
+      <div style="min-width:0"><div class="t1">${esc(new Date(v.at).toLocaleString("zh-CN", {month:"numeric", day:"numeric", hour:"2-digit", minute:"2-digit"}))}${i === 0 ? '<span class="badge">当前</span>' : ""}</div>
+        <div class="t2">${esc(v.msg)}</div><div class="t2" data-ver-info></div></div>
+      <span style="display:flex;gap:6px">${S.downloads ? `<button class="btn sm" type="button" data-ver-dl>下载</button>` : ""}${i ? `<button class="btn sm" type="button" data-ver-restore>恢复到这个版本</button>` : ""}</span></div>`).join("")}</div>`;
+}
+async function verAction(btn){
+  const row = btn.closest("[data-ver]"), sha = row.dataset.ver, info = row.querySelector("[data-ver-info]");
+  try {
+    if(btn.matches("[data-ver-dl]")){
+      const v = await S.db.version(sha);
+      await S.downloads.save({filename:`desk-${sha.slice(0,7)}.json`, data:JSON.stringify(v, null, 1)}); return;
+    }
+    if(!btn.dataset.armed){
+      btn.disabled = true; const v = await S.db.version(sha); btn.disabled = false;
+      const n = Object.values(v.jobs || {}).filter(x => x && !x._deleted).length;
+      const done = Object.values(v.jobs || {}).filter(x => x && !x._deleted && !["inbox","watch"].includes(x.status || "watch")).length;
+      info.textContent = `这个版本有 ${n} 个职位，其中 ${done} 个已经筛选过（不是“待筛选”或“待定”）。现在有 ${S.jobs.size} 个。`;
+      btn.dataset.armed = "1"; btn.textContent = "确认恢复"; btn.classList.add("danger");
+      setTimeout(() => { if(btn.isConnected){ delete btn.dataset.armed; btn.textContent = "恢复到这个版本"; btn.classList.remove("danger"); } }, 8000);
+      return;
+    }
+    btn.disabled = true; btn.textContent = "正在恢复…"; flushAll();
+    await S.db.restore(sha); closeDlg(); toast("已恢复。原来的版本仍在历史里。");
+  } catch(e){ btn.disabled = false; toast(e && e.code === "conflict" ? "刚才有别的设备保存了数据，请再试一次。" : "操作失败，检查网络后再试。"); }
+}
+
 /* ---------- Backup ---------- */
 async function exportBackup(){
   if(!S.downloads){ toast("这个视图不能保存文件。"); return; }
@@ -2050,6 +2194,14 @@ function armDelete(btn, fn){
 }
 
 document.addEventListener("click", e => {
+  { const t0 = e.target.closest("[data-history],[data-ver-dl],[data-ver-restore],[data-dstep],[data-dtriage],[data-clear-filters]");
+    if(t0){
+      if(t0.matches("[data-history]")){ historyDialog(); return; }
+      if(t0.matches("[data-ver-dl],[data-ver-restore]")){ verAction(t0); return; }
+      if(t0.matches("[data-dstep]")){ drawerStep(+t0.dataset.dstep); return; }
+      if(t0.matches("[data-dtriage]")){ triageAndNext(t0.dataset.dtriage); return; }
+      if(t0.matches("[data-clear-filters]")){ S.jobFilter = {...S.jobFilter, q:"", due:"", tag:"", status:"active", onlyNew:false}; render(); return; }
+    } }
   if(e.target.closest("select, .selcell")) return;
   const t = e.target.closest("button, [data-open-job], [data-edit-event], [data-edit-mat], a, label");
   if(!t) return;
@@ -2127,26 +2279,39 @@ document.addEventListener("submit", e => {
   const inp = $(`[data-ed-add="${kind}"] input`); inp && inp.focus();
 });
 document.addEventListener("keydown", e => {
+  if(S.drawerJob && !dlg.open && !AI.open && !e.ctrlKey && !e.metaKey && !e.altKey && !e.isComposing && !/^(INPUT|TEXTAREA|SELECT)$/.test((e.target.tagName || ""))){
+    const j = S.jobs.get(S.drawerJob); const inbox = j && (j.status || "watch") === "inbox";
+    if(e.key === "ArrowRight" || e.key === "j"){ e.preventDefault(); drawerStep(1); return; }
+    if(e.key === "ArrowLeft" || e.key === "k"){ e.preventDefault(); drawerStep(-1); return; }
+    if(inbox && (e.key === "a" || e.key === "A")){ e.preventDefault(); triageAndNext("watch"); return; }
+    if(inbox && (e.key === "p" || e.key === "P")){ e.preventDefault(); triageAndNext("prep"); return; }
+    if(inbox && (e.key === "s" || e.key === "S")){ e.preventDefault(); triageAndNext("skip"); return; }
+  }
   if(e.target.id === "ai-input" && e.key === "Enter" && !e.shiftKey && !e.isComposing){ e.preventDefault(); sendAI(e.target.value); return; }
   if(e.key === "Escape" && AI.open && !dlg.open && !S.drawerJob){ closeAI(); return; }
   if(e.key === "Escape" && S.drawerJob && !dlg.open){ closeDrawer(); return; }
   if((e.key === "Enter" || e.key === " ") && e.target.matches("[data-open-job],[data-edit-event],[data-edit-mat]") && e.target.tagName !== "BUTTON"){ e.preventDefault(); e.target.click(); }
 });
-document.addEventListener("toggle", e => { const d = e.target; if(d.matches && d.matches("details[data-qa]")){ if(d.open) S.openQa = d.dataset.qa; else if(S.openQa === d.dataset.qa) S.openQa = null; } }, true);
+document.addEventListener("toggle", e => { const d = e.target;
+  if(d.matches && d.matches("details[data-lazy-text]") && d.open && !d.dataset.loaded){
+    const id = d.dataset.lazyText, j = S.jobs.get(id), box = d.querySelector(".fulltext"); d.dataset.loaded = "1";
+    S.db.text(j.textRef, id).then(t => { box.textContent = t || "没有保存原文。"; }).catch(() => { box.textContent = "读取原文失败，稍后再试。"; delete d.dataset.loaded; });
+  } if(d.matches && d.matches("details[data-qa]")){ if(d.open) S.openQa = d.dataset.qa; else if(S.openQa === d.dataset.qa) S.openQa = null; } }, true);
 
 document.addEventListener("input", e => {
   const t = e.target;
-  if(t.id === "job-q"){ S.jobFilter.q = t.value; render(); return; }
+  if(t.id === "job-q"){ if(e.isComposing || COMPOSING) return; S.jobFilter.q = t.value; updateJobsBody(); return; }
   if(t.matches("[data-jf]") && S.drawerJob && (t.tagName === "TEXTAREA" || t.type === "text" || t.type === "url")){ patch("jobs", S.drawerJob, {[t.dataset.jf]: t.value}, 800); render(); return; }
   if(t.matches("[data-qa-field]") && (t.tagName === "TEXTAREA" || t.type === "text")){ const id = t.closest("[data-qa]").dataset.qa; S.openQa = id; patch("qa", id, {[t.dataset.qaField]: t.value}, 800);
     if(t.dataset.qaField === "q"){ const q = t.closest("details").querySelector("summary .q"); q.firstChild.nodeValue = t.value || "新问题"; } return; }
   if(t.matches("[data-pf]") && PARSE && PARSE.results){ PARSE.results[+t.closest("[data-pi]").dataset.pi][t.dataset.pf] = t.value; return; }
-  if(t.id === "imp-q"){ IMP.q = t.value; IMP.limit = 300; clearTimeout(renderImport._t); renderImport._t = setTimeout(() => { renderImport(); const el = $("#imp-q"); el.focus(); el.setSelectionRange(el.value.length, el.value.length); }, 200); return; }
+  if(t.id === "imp-q"){ if(e.isComposing || COMPOSING) return; IMP.q = t.value; IMP.limit = 300; clearTimeout(renderImport._t); renderImport._t = setTimeout(() => { renderImport(); const el = $("#imp-q"); el.focus(); el.setSelectionRange(el.value.length, el.value.length); }, 200); return; }
 });
 document.addEventListener("change", e => {
   const t = e.target;
   if(t.id === "job-status"){ S.jobFilter.status = t.value; render(); return; }
   if(t.id === "job-sort"){ S.jobFilter.sort = t.value; render(); return; }
+  if(t.id === "job-due"){ S.jobFilter.due = t.value; render(); return; }
   if(t.id === "cal-dl"){ S.calDeadlines = t.checked; render(); return; }
   if(t.id === "cal-past"){ S.calPast = t.checked; render(); return; }
   if(t.matches("[data-jf]") && S.drawerJob && (t.tagName === "SELECT" || t.type === "date")){ const v = t.dataset.jf === "prio" ? +t.value : t.value; patch("jobs", S.drawerJob, {[t.dataset.jf]: v}); refresh(); return; }
@@ -2200,7 +2365,7 @@ setView(location.hash.slice(1) || "overview");
     const first = !S.loaded[key]; S.loaded[key] = true;
     if(key === "meta" && (first || changed)) applySettings();
     if(first || changed){
-      render();
+      render(!first);
       if(S.drawerJob && key !== "qa"){ const a = document.activeElement; const typing = a && $("#drawer-root").contains(a) && (a.tagName === "TEXTAREA" || a.tagName === "INPUT");
         if(!typing) renderDrawer(false); }
     }
