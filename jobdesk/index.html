@@ -30,8 +30,9 @@ function setStatus(text, kind){ statusText = text; statusKind = kind || ""; cons
 const hhmm = () => new Date().toLocaleTimeString("zh-CN", {hour:"2-digit", minute:"2-digit"});
 
 /* ---------- GitHub-backed document store ---------- */
-const COLLS = ["jobs","events","materials","qa","meta"];
-function makeStore(c){
+const DESK_COLLS = ["jobs","events","materials","qa","meta"];
+function makeStore(c, o = {}){
+  const COLLS = o.colls || DESK_COLLS, LABEL = o.label || "desk";
   const api = `https://api.github.com/repos/${encodeURIComponent(c.owner)}/${encodeURIComponent(c.repo)}/contents/${c.path.split("/").map(encodeURIComponent).join("/")}`;
   const H = {Authorization:"Bearer " + c.token, Accept:"application/vnd.github+json", "X-GitHub-Api-Version":"2022-11-28"};
   let data = empty(), sha = null, etag = null, knownJobs = 0;
@@ -50,7 +51,7 @@ function makeStore(c){
     let text;
     if(j.content && j.encoding === "base64") text = b64dec(j.content);
     else { const raw = await fetch(`${api}?ref=${encodeURIComponent(c.branch)}`, {headers:{...H, Accept:"application/vnd.github.raw"}, cache:"no-store"}); if(!raw.ok) throw {code:"http", status:raw.status}; text = await raw.text(); }
-    let parsed; try { parsed = JSON.parse(text || "{}"); } catch { throw {code:"corrupt", message:"desk.json 不是有效的 JSON"}; }
+    let parsed; try { parsed = JSON.parse(text || "{}"); } catch { throw {code:"corrupt", message:c.path + " 不是有效的 JSON"}; }
     const out = norm(parsed); knownJobs = Math.max(knownJobs, jobCount(out));
     return {status:200, sha:j.sha, etag:tag, data:out};
   }
@@ -91,8 +92,8 @@ function makeStore(c){
             break;
           }
           const body = JSON.stringify(next);
-          if(body.length > 950000) setStatus("数据接近 1MB 上限，建议清理旧职位", "warn");
-          const res = await put(body, `desk: 更新 ${mine.size} 项`);
+          if(body.length > 950000) setStatus(LABEL === "desk" ? "数据接近 1MB 上限，建议清理旧职位" : "面试准备数据较大，可以删掉不用的模拟题", "warn");
+          const res = await put(body, `${LABEL}: 更新 ${mine.size} 项`);
           if(res.conflict){
             const remote = await getRemote(false);
             if(remote.status !== 200) throw {code:"http", status:remote.status, message:"GitHub 上找不到数据文件"};
@@ -174,6 +175,35 @@ function makeStore(c){
     },
   };
   const textCache = {};
+  const repoBase = `https://api.github.com/repos/${encodeURIComponent(c.owner)}/${encodeURIComponent(c.repo)}/contents/`;
+  const dir = c.path.includes("/") ? c.path.replace(/[^/]+$/, "") : "";
+  const fileUrl = p => repoBase + (dir + p).split("/").map(encodeURIComponent).join("/");
+  async function fileSha(p){
+    const r = await fetch(`${fileUrl(p)}?ref=${encodeURIComponent(c.branch)}`, {method:"GET", headers:{...H, Accept:"application/vnd.github.object"}, cache:"no-store"});
+    if(r.status === 404) return null; if(!r.ok) throw {code:r.status === 401 || r.status === 403 ? "auth" : "http", status:r.status};
+    return (await r.json()).sha || null;
+  }
+  store.readRaw = async p => {
+    const r = await fetch(`${fileUrl(p)}?ref=${encodeURIComponent(c.branch)}`, {headers:{...H, Accept:"application/vnd.github.raw"}, cache:"no-store"});
+    if(r.status === 404) throw {code:"not_found"}; if(!r.ok) throw {code:"http", status:r.status};
+    return await r.text();
+  };
+  store.writeRaw = async (p, text, message) => {
+    for(let i = 0; i < 3; i++){
+      const s0 = await fileSha(p);
+      const r = await fetch(fileUrl(p), {method:"PUT", headers:{...H, "Content-Type":"application/json"}, body:JSON.stringify({message:message || `${LABEL}: 更新 ${p}`, content:b64enc(text), branch:c.branch, ...(s0 ? {sha:s0} : {})})});
+      if(r.status === 409 || r.status === 422) continue;
+      if(r.status === 401 || r.status === 403) throw {code:"auth", status:r.status};
+      if(!r.ok) throw {code:"http", status:r.status};
+      return;
+    }
+    throw {code:"conflict"};
+  };
+  store.deleteRaw = async (p, message) => {
+    const s0 = await fileSha(p); if(!s0) return;
+    const r = await fetch(fileUrl(p), {method:"DELETE", headers:{...H, "Content-Type":"application/json"}, body:JSON.stringify({message:message || `${LABEL}: 删除 ${p}`, sha:s0, branch:c.branch})});
+    if(!r.ok && r.status !== 404) throw {code:"http", status:r.status};
+  };
   return store;
 }
 
@@ -189,8 +219,9 @@ function parseLoose(t){
 }
 function makeDeepseek(c){
   const base = (c.dsBase || DEFAULTS.dsBase).replace(/\/+$/, "");
-  async function call(messages, tools, signal, onDelta){
-    const body = {model:c.dsModel || "deepseek-flash", messages, stream:true, thinking:{type:"disabled"}, max_tokens:8000};
+  async function call(messages, tools, signal, onDelta, extra = {}){
+    const body = {model:extra.model || c.dsModel || "deepseek-flash", messages, stream:true, thinking:{type:"disabled"}, max_tokens:extra.maxTokens || 8000};
+    if(extra.json && !(tools && tools.length)) body.response_format = {type:"json_object"};
     if(tools && tools.length) body.tools = tools.map(t => ({type:"function", function:{name:t.name, description:t.description, parameters:t.inputSchema || {type:"object", properties:{}}}}));
     let res;
     try { res = await fetch(base + "/chat/completions", {method:"POST", headers:{"Content-Type":"application/json", Authorization:"Bearer " + c.dsKey}, body:JSON.stringify(body), signal}); }
@@ -223,7 +254,7 @@ function makeDeepseek(c){
     if(opts.images && opts.images.length){ const urls = await Promise.all([...opts.images].slice(0, 4).map(blobToDataUrl)); const last = msgs[msgs.length - 1]; last.content = [{type:"text", text:last.content}, ...urls.map(u => ({type:"image_url", image_url:{url:u}}))]; }
     const tools = opts.tools || []; let prefix = "";
     for(let round = 0; round < 6; round++){
-      const r = await call(msgs, round < 5 ? tools : [], opts.signal, t => opts.onText && opts.onText({text:prefix + t, delta:""}));
+      const r = await call(msgs, round < 5 ? tools : [], opts.signal, t => opts.onText && opts.onText({text:prefix + t, delta:""}), {model:opts.model, json:opts.json, maxTokens:opts.maxTokens});
       if(r.calls.length && tools.length){
         msgs.push({role:"assistant", content:r.content || "", tool_calls:r.calls.map(x => ({id:x.id, type:"function", function:{name:x.name, arguments:x.args || "{}"}}))});
         if(r.content) prefix += r.content + "\n\n";
@@ -255,8 +286,15 @@ function getStore(){
   if(!cfg.token || !cfg.owner || !cfg.repo) return Promise.resolve(null);
   return storePromise ||= (async () => { const s = makeStore(cfg); try { await s.load(); return s; } catch(e){ window.__loadError = e; setStatus(e && e.code === "auth" ? "GitHub 令牌无效" : "连不上 GitHub", "err"); return null; } })();
 }
+let prepPromise = null;
+function getPrepStore(){
+  if(!cfg.token || !cfg.owner || !cfg.repo) return Promise.resolve(null);
+  const dir = cfg.path.includes("/") ? cfg.path.replace(/[^/]+$/, "") : "";
+  return prepPromise ||= (async () => { const s = makeStore({...cfg, path:dir + "prep.json"}, {colls:["docs","profile","mock"], label:"prep"}); try { await s.load(); return s; } catch(e){ console.error(e); return null; } })();
+}
 window.claude = { use: async name => {
   if(name === "db") return getStore();
+  if(name === "prep") return getPrepStore();
   if(name === "sample") return cfg.dsKey ? makeDeepseek(cfg) : null;
   if(name === "downloads") return downloads;
   return null;
@@ -740,6 +778,66 @@ dialog::backdrop{background:rgba(10,16,22,.42)}
   .imp-row{grid-template-columns:22px minmax(0,1fr)}
   .imp-row .d{grid-column:2; text-align:left}
 }
+
+/* Interview prep */
+.ptabs{display:flex; gap:4px; border-bottom:1px solid var(--line); margin:0 0 16px; overflow-x:auto}
+.ptab{border:0; background:none; padding:8px 14px; font-weight:550; color:var(--muted); cursor:pointer; border-bottom:2px solid transparent; margin-bottom:-1px; white-space:nowrap}
+.ptab[aria-selected="true"]{color:var(--accent); border-bottom-color:var(--accent)}
+.phead{display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:8px}
+.phead.pad0{padding:14px 16px 6px; margin:0}
+.phead .ph{font-size:15px; font-weight:650; margin:0}
+.panel.pad{padding:16px}
+.prof, .gen{margin-bottom:16px}
+.prof textarea{width:100%; font-size:13.5px; line-height:1.6}
+.docs .kind-group{padding:4px 16px 10px}
+.docrow{display:flex; align-items:center; justify-content:space-between; gap:12px; padding:9px 0; border-top:1px solid var(--line)}
+.docrow .t1{font-weight:550}
+.docrow .t2{color:var(--muted); font-size:12.5px; overflow-wrap:anywhere}
+.docact{display:flex; gap:6px; align-items:center; flex-wrap:wrap; justify-content:flex-end; flex-shrink:0}
+.gen-grid{display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; margin-bottom:10px}
+.gen-grid .field select{width:100%}
+.mset{margin-bottom:16px}
+.mset-head{display:flex; justify-content:space-between; align-items:center; gap:10px; padding:12px 16px; border-bottom:1px solid var(--line); flex-wrap:wrap; background:var(--raised); border-radius:8px 8px 0 0}
+.mset-head .status-line{margin-left:8px}
+.mq{padding:14px 16px; border-top:1px solid var(--line)}
+.mset-head + .mq{border-top:0}
+.mq-top{display:flex; align-items:center; gap:8px; margin-bottom:4px}
+.ltag{display:inline-block; font-size:11px; font-weight:700; padding:1px 6px; border-radius:4px; letter-spacing:.02em}
+.ltag-zh{background:var(--soon-soft); color:var(--soon)}
+.ltag-en{background:var(--accent-soft); color:var(--accent)}
+.mq-q{font-size:15px; font-weight:600; line-height:1.5}
+.stag{display:inline-block; font-size:11px; font-weight:650; padding:1px 6px; border-radius:4px; background:var(--urgent-soft); color:var(--urgent)}
+.stag.real{background:var(--ok-soft); color:var(--ok)}
+.lib-tools{flex-wrap:wrap}
+.lib-tools input[type=search]{flex:1 1 220px; min-width:0}
+.lib-bar{display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin:0 0 10px}
+#lib-body .mq:first-child{border-top:0}
+.mq-intent{color:var(--muted); font-size:12.5px; margin-top:3px}
+.mq-acts{display:flex; gap:6px; flex-wrap:wrap; align-items:center; margin-top:10px}
+.mq-acts [aria-pressed="true"]{background:var(--accent-soft); border-color:var(--accent); color:var(--accent)}
+.ans{margin-top:12px; border:1px solid var(--line); border-radius:8px; padding:12px 14px; background:var(--raised)}
+.ans-tip{font-size:13px; color:var(--muted); margin-bottom:10px}
+.seg-row{display:flex; gap:10px; flex-wrap:wrap; margin-bottom:10px}
+.seg{display:inline-flex; border:1px solid var(--line); border-radius:6px; overflow:hidden; background:var(--surface)}
+.seg button{border:0; background:none; padding:4px 10px; font-size:12.5px; cursor:pointer; color:var(--muted)}
+.seg button + button{border-left:1px solid var(--line)}
+.seg button[aria-pressed="true"]{background:var(--accent); color:var(--accent-ink)}
+.ans-text{font-size:14px; line-height:1.75; white-space:normal}
+.ans-text ul, .prac-ol{margin:0; padding-left:20px}
+.ans-meta{display:flex; justify-content:space-between; align-items:center; margin-top:8px; gap:8px}
+.fups{margin-top:10px; font-size:13px}
+.fups summary{cursor:pointer; color:var(--muted)}
+.fups ul{margin:6px 0 0; padding-left:18px}
+.fups li{margin-bottom:6px}
+.fups li span{display:block; color:var(--muted); font-size:12.5px}
+.mq-prac{margin-top:12px; display:flex; flex-direction:column; gap:8px}
+.mq-prac textarea{width:100%}
+.mq-fb{border:1px solid var(--line); border-radius:8px; padding:10px 12px; font-size:13.5px}
+.prof-preview{font-size:13.5px; line-height:1.6; max-height:55vh; overflow:auto; border:1px solid var(--line); border-radius:8px; padding:10px 14px}
+.prac-q{font-size:19px; font-weight:600; line-height:1.5}
+.prac-clock{font-variant-numeric:tabular-nums; font-weight:650; margin-left:auto; margin-right:12px; color:var(--muted)}
+.prac-clock[data-over="1"]{color:var(--urgent)}
+@media (max-width:640px){ .docrow{flex-direction:column; align-items:flex-start} .docact{justify-content:flex-start} .mset-head .status-line{display:block; margin-left:0} }
 @media (prefers-reduced-motion:reduce){*{transition:none!important; animation:none!important}}
 </style>
 
@@ -836,6 +934,7 @@ const LOCAL_TZ = (() => { try { return Intl.DateTimeFormat().resolvedOptions().t
 
 /* ---------- State ---------- */
 const S = { db:null, jobs:new Map(), events:new Map(), mats:new Map(), qa:new Map(), meta:new Map(),
+  pdb:null, pdbFailed:false, docs:new Map(), prof:new Map(), mock:new Map(), ploaded:{docs:false, prof:false, mock:false}, prepTab: lsGet("jd-preptab") || "mock",
   loaded:{jobs:false,events:false,mats:false,qa:false,meta:false}, view:"overview",
   jobFilter:{q:"", status:"active", sort:"deadline", tag:"", onlyNew:false, due:""}, calPast:false, calDeadlines:true,
   qaCat:"全部", drawerJob:null, downloads:null, denied:false, sel:new Set(),
@@ -900,17 +999,18 @@ function enqueue(path, fn){
   });
   chains.set(path, next); return next;
 }
+function storeFor(coll){ return PREP_COLLS.has(coll) ? S.pdb : S.db; }
 function save(coll, id, delay=0){
-  if(!S.db) return;
+  if(!storeFor(coll)) return;
   const path = `${coll}/${id}`;
   clearTimeout(timers.get(path));
   const run = () => { timers.delete(path); const doc = S[collKey(coll)].get(id); if(!doc) return;
-    enqueue(path, () => S.db.doc(path).set(JSON.parse(JSON.stringify(doc)))); };
+    enqueue(path, () => storeFor(coll).doc(path).set(JSON.parse(JSON.stringify(doc)))); };
   if(delay) timers.set(path, setTimeout(run, delay)); else run();
 }
-function flushAll(){ for(const [path, t] of timers){ clearTimeout(t); const [coll,id] = path.split("/"); timers.delete(path); const doc = S[collKey(coll)].get(id); if(doc) enqueue(path, () => S.db.doc(path).set(JSON.parse(JSON.stringify(doc)))); } }
-function remove(coll, id){ clearTimeout(timers.get(`${coll}/${id}`)); S[collKey(coll)].delete(id); if(S.db) enqueue(`${coll}/${id}`, () => S.db.doc(`${coll}/${id}`).delete()); }
-function collKey(c){ return {jobs:"jobs", events:"events", materials:"mats", qa:"qa", meta:"meta"}[c]; }
+function flushAll(){ for(const [path, t] of timers){ clearTimeout(t); const [coll,id] = path.split("/"); timers.delete(path); const doc = S[collKey(coll)].get(id); if(doc && storeFor(coll)) enqueue(path, () => storeFor(coll).doc(path).set(JSON.parse(JSON.stringify(doc)))); } }
+function remove(coll, id){ clearTimeout(timers.get(`${coll}/${id}`)); S[collKey(coll)].delete(id); if(storeFor(coll)) enqueue(`${coll}/${id}`, () => storeFor(coll).doc(`${coll}/${id}`).delete()); }
+function collKey(c){ return {jobs:"jobs", events:"events", materials:"mats", qa:"qa", meta:"meta", docs:"docs", profile:"prof", mock:"mock"}[c]; }
 function patch(coll, id, p, delay=0){
   const cur = S[collKey(coll)].get(id) || {};
   S[collKey(coll)].set(id, {...cur, ...p, updatedAt: nowIso()});
@@ -964,6 +1064,7 @@ function render(background){
   const main = $("#main");
   if(COMPOSING){ RENDER_PENDING = true; return; }
   if(background && S.view === "jobs" && document.activeElement && document.activeElement.id === "job-q"){ updateJobsBody(); return; }
+  if(background && S.view === "prep" && document.activeElement && document.activeElement.id === "lib-q"){ updateLibBody(); return; }
   if(background && isTyping()){ RENDER_PENDING = true; return; }
   if(S.denied){ main.innerHTML = `<div class="empty"><strong>这个页面的数据只对所有者开放。</strong>如果你是所有者，请登录后重新打开。</div>`; return; }
   if(!S.db || !allLoaded()){ return; }
@@ -1258,8 +1359,8 @@ function vMaterials(){
     <div class="panel">${body}</div>`;
 }
 
-/* Prep */
-function vPrep(){
+/* Prep: question bank tab */
+function vQaBank(){
   const cats = ["全部", ...QA_CATS];
   const list = [...S.qa.entries()].filter(([,x]) => S.qaCat === "全部" || x.cat === S.qaCat).sort((a,b) => (a[1].createdAt||"").localeCompare(b[1].createdAt||""));
   const lv = ["未准备","有草稿","熟练"];
@@ -1280,10 +1381,11 @@ function vPrep(){
         </div>
       </div>
     </details>`; }).join("")
-    : `<div class="empty">${S.qa.size ? "这个类别下还没有问题。" : "<strong>题库是空的</strong>添加你预计会被问到的问题，以及想问对方的问题。"}</div>`;
+    : `<div class="empty">${S.qa.size ? "这个类别下还没有问题。" : "<strong>还没有要点</strong>在模拟题上点“存为要点”，或者自己添加预计会被问到的问题、想问对方的问题。"}</div>`;
   return `
     <div class="view-head"><div><h1>面试准备</h1><p>${S.qa.size} 个问题：熟练 ${counts[2]}，有草稿 ${counts[1]}，未准备 ${counts[0]}</p></div>
       <button class="btn primary" type="button" data-new-qa>添加问题</button></div>
+    ${prepTabs()}
     <div class="toolbar"><div class="cats" role="group" aria-label="类别">${cats.map(c => `<button type="button" class="chip" data-qa-cat="${esc(c)}" aria-pressed="${S.qaCat===c}">${esc(c)}</button>`).join("")}</div></div>
     <div class="panel">${body}</div>`;
 }
@@ -2024,7 +2126,7 @@ function aiRules(){
 - 模拟面试时一次只问一个问题，等他回答后再点评、追问；他要求时可用 save_answer 把整理后的要点存进题库。
 
 工作台数据：
-${aiContext()}`;
+${aiContext()}${(S.prof.get("main") || {}).text ? "\n\n他的背景档案（来自面试准备 → 我的材料）：\n" + String(S.prof.get("main").text).slice(0, 5000) : ""}`;
 }
 function aiTools(){
   const jobOut = (id, j) => { const [d,k] = matProgress(j); return {id, 学校:jobName(j), 学院:j.dept||"", 岗位:j.title||"", 状态:(ST[j.status||"watch"]||ST.watch).l, 截止:j.deadline||"", 截止说明:j.deadlineNote||"", 城市:j.city||"", 材料:`${d}/${k}`}; };
@@ -2346,6 +2448,587 @@ document.addEventListener("change", e => {
     const go = $("#imp-go"); go.disabled = !IMP.sel.size; go.textContent = `导入所选 ${IMP.sel.size} 个职位`; return; }
 });
 
+/* ---------- Interview prep: materials library, background profile, mock interviews ----------
+   Stored in prep.json (+ prep/docs/<id>.txt for material texts), separate from desk.json. */
+const PREP_COLLS = new Set(["docs","profile","mock"]);
+const DOC_KINDS = ["简历","求职论文","研究陈述","教学","求职信","论文","其他"];
+const MOCK_CATS = [{k:"jmp",l:"求职论文"},{k:"research",l:"其他研究"},{k:"plan",l:"研究规划与基金"},{k:"teach",l:"教学与带学生"},{k:"fit",l:"动机与学校匹配"},{k:"general",l:"综合与人事"}];
+const MOCK_CAT_L = {...Object.fromEntries(MOCK_CATS.map(c => [c.k, c.l])), pressure:"压力与质疑"};
+const STYLES = [{k:"mix",l:"常规 + 压力混合"},{k:"normal",l:"只要常规题"},{k:"harsh",l:"只要压力题"}];
+const STYLE_L = {normal:"常规", harsh:"压力型"};
+const styleOf = x => x.style || (x.cat === "pressure" || x.level === "压力" ? "harsh" : "normal");
+const SCENES = [{k:"dept",l:"院系面试（综合）"},{k:"talk",l:"求职报告后的问答"},{k:"teach",l:"试讲后的提问"},{k:"lead",l:"学院领导 / 人事面谈"}];
+const LENS = [{k:"s30",l:"30 秒",zh:120,en:75},{k:"m1",l:"1 分钟",zh:250,en:150},{k:"m3",l:"3 分钟",zh:700,en:420},{k:"outline",l:"要点"}];
+const QA_CAT_MAP = {jmp:"学术报告",research:"学术报告",plan:"研究规划",teach:"教学与试讲",fit:"动机与匹配",pressure:"学术报告",general:"通用"};
+const DOC_CAP = 120000;
+const MOCKOPT_KEY = "jd-mockopts";
+function mockOpts(){ let o = {}; try { o = JSON.parse(lsGet(MOCKOPT_KEY) || "{}"); } catch {} const r = {jobId:"", scene:"dept", n:8, lang:"mix", style:"mix", cats:["jmp","research","plan","teach","fit","general"], model:"", ...o};
+  r.cats = (r.cats || []).filter(k => MOCK_CATS.some(c => c.k === k)); if(!r.cats.length) r.cats = MOCK_CATS.map(c => c.k); return r; }
+function setMockOpts(p){ lsSet(MOCKOPT_KEY, JSON.stringify({...mockOpts(), ...p})); }
+const PREP = { busy:new Map(), view:new Map(), gen:null, genText:"", seedBusy:"", openPractice:new Set(), lib:{q:"", cat:"", style:"", lang:"", st:"", src:""}, libLimit:40 };
+
+/* Text cleaning shared by every extractor: PDFs break lines inside paragraphs and put spaces between Chinese characters */
+function cleanText(t){
+  const cj = "[\\u3400-\\u9fff\\uff00-\\uffef\\u3000-\\u303f“”‘’《》（）—…·]";
+  t = String(t || "").replace(/\f/g, "\n").replace(/\r/g, "").replace(/[ \t　]+/g, " ");
+  const sp = new RegExp(`(${cj}) (?=${cj})`, "g"); for(let i = 0; i < 3; i++) t = t.replace(sp, "$1");
+  t = t.replace(/(\w)-\n(\w)/g, "$1$2").replace(new RegExp(`(${cj})\\n(?=${cj})`, "g"), "$1").replace(/([^\n])\n(?!\n)/g, "$1 ").replace(/\n{3,}/g, "\n\n").replace(/ {2,}/g, " ");
+  return t.trim();
+}
+const VENDOR = "vendor/";
+function loadScript(src){ return new Promise((res, rej) => { const s = document.createElement("script"); s.src = src; s.onload = res; s.onerror = () => rej({code:"vendor"}); document.head.appendChild(s); }); }
+async function extractText(file){
+  const name = file.name.toLowerCase();
+  if(/\.(txt|md|tex|csv)$/.test(name)) return cleanText(await file.text());
+  if(name.endsWith(".docx")){
+    if(!window.mammoth) await loadScript(VENDOR + "mammoth.browser.min.js");
+    const r = await window.mammoth.extractRawText({arrayBuffer:await file.arrayBuffer()}); return cleanText(r.value);
+  }
+  if(name.endsWith(".pdf")){
+    if(!window.pdfjsLib) await loadScript(VENDOR + "pdf.min.js");
+    window.pdfjsLib.GlobalWorkerOptions.workerSrc = VENDOR + "pdf.worker.min.js";
+    const doc = await window.pdfjsLib.getDocument({data:new Uint8Array(await file.arrayBuffer()), cMapUrl:VENDOR + "cmaps/", cMapPacked:true}).promise;
+    let out = "";
+    for(let i = 1; i <= doc.numPages && out.length < DOC_CAP * 1.5; i++){
+      const c = await (await doc.getPage(i)).getTextContent();
+      for(const it of c.items){ out += it.str; if(it.hasEOL) out += "\n"; }
+      out += "\n\n";
+    }
+    return cleanText(out);
+  }
+  throw {code:"type"};
+}
+function guessKind(name){
+  const n = name.toLowerCase();
+  if(/cv|简历|resume/.test(n)) return "简历";
+  if(/job.?market|jmp|求职论文/.test(n)) return "求职论文";
+  if(/research.?statement|研究陈述|研究计划/.test(n)) return "研究陈述";
+  if(/teach|教学|助教|评教/.test(n)) return "教学";
+  if(/cover|求职信|申请信/.test(n)) return "求职信";
+  return "论文";
+}
+const docSort = (a, b) => (DOC_KINDS.indexOf(a[1].kind) - DOC_KINDS.indexOf(b[1].kind)) || ((a[1].order ?? 999) - (b[1].order ?? 999)) || (a[1].title || "").localeCompare(b[1].title || "", "zh-CN");
+
+/* Material texts are loaded on demand and cached per revision */
+const DOCTEXT = new Map();
+function docText(id){
+  const d = S.docs.get(id); if(!d || !d.file || !S.pdb) return Promise.resolve("");
+  const key = id + "@" + (d.rev || 0);
+  if(!DOCTEXT.has(key)) DOCTEXT.set(key, S.pdb.readRaw(d.file).catch(e => { DOCTEXT.delete(key); throw e; }));
+  return DOCTEXT.get(key);
+}
+async function writeDocText(id, text, meta){
+  const d = S.docs.get(id) || {};
+  const file = d.file || `prep/docs/${id}.txt`; text = text.slice(0, DOC_CAP);
+  await S.pdb.writeRaw(file, text, `prep: 材料 ${(meta && meta.title) || d.title || id}`);
+  const rev = (d.rev || 0) + 1; DOCTEXT.set(id + "@" + rev, Promise.resolve(text));
+  S.docs.set(id, {...d, ...(meta || {}), file, rev, chars:text.length, updatedAt:nowIso()}); save("docs", id);
+}
+
+/* ---------- What the AI gets to read ---------- */
+const CTX_CAP = {简历:7000, 求职论文:16000, 研究陈述:16000, 教学:3000, 求职信:4000, 论文:1200, 其他:3000};
+function mentions(text, d){
+  const t = String(text || "").toLowerCase(), title = String(d.title || "");
+  const words = title.toLowerCase().match(/[a-z]{5,}/g) || [];
+  if(words.length && words.filter(w => t.includes(w)).length >= Math.min(2, words.length)) return true;
+  const zh = title.replace(/[^\u4e00-\u9fff]/g, "");
+  for(let i = 0; i + 4 <= zh.length; i++) if(t.includes(zh.slice(i, i + 4))) return true;
+  return false;
+}
+async function prepContext(focus){
+  const prof = (S.prof.get("main") || {}).text || "";
+  const docs = [...S.docs.entries()].filter(([, d]) => d.use !== false).sort(docSort);
+  const letters = docs.filter(([, d]) => d.kind === "求职信").sort((a, b) => (b[1].updatedAt || "").localeCompare(a[1].updatedAt || "")).slice(0, 2).map(([id]) => id);
+  const keep = docs.filter(([id, d]) => d.kind !== "求职信" || letters.includes(id));
+  const texts = await Promise.all(keep.map(([id]) => docText(id).catch(() => "")));
+  const core = [], papers = [];
+  keep.forEach(([id, d], i) => {
+    const t = texts[i]; if(!t) return;
+    let cap = CTX_CAP[d.kind] ?? 3000; if(focus && d.kind === "论文" && mentions(focus, d)) cap = 9000;
+    const seg = `【${d.kind}｜${d.title || "未命名"}${d.note ? "｜" + d.note : ""}】\n${t.slice(0, cap)}`;
+    (d.kind === "论文" ? papers : core).push(seg);
+  });
+  let out = `# 候选人背景档案\n${prof || "（还没有背景档案）"}\n\n# 材料原文（节选）\n${core.join("\n\n") || "（还没有上传材料）"}`;
+  if(papers.length) out += `\n\n# 其他论文（开头部分）\n${papers.join("\n\n")}`;
+  return out.slice(0, 110000);
+}
+function prepSystem(ctx){
+  return `你是一位资深的中国高校经济学、金融学、管理科学学院教师招聘委员会成员，也是面试教练，正在帮助候选人李金璞准备中国大陆和澳门高校的教职面试。
+关于候选人的一切事实只能来自下面的背景档案和材料；材料里没有的信息不要编造（不要编造数字、奖项、课程、合作者或发表情况）。
+
+${ctx}`;
+}
+async function jobBrief(id){
+  const j = id && S.jobs.get(id); if(!j) return "";
+  let full = j.full || ""; if(!full && j.textRef && S.db && S.db.text){ try { full = await S.db.text(j.textRef, id); } catch {} }
+  return `面试单位：${jobName(j)}${j.dept ? " " + j.dept : ""}${j.title ? "，岗位：" + j.title : ""}${j.city ? "，城市：" + j.city : ""}${j.fields ? "，招聘方向：" + j.fields : ""}${j.notes ? "\n他的笔记：" + String(j.notes).slice(0, 800) : ""}${full ? "\n招聘原文节选：" + String(full).slice(0, 2500) : ""}`;
+}
+function aiErr(e){ return e && e.code === "cancelled" ? "已停止。" : (PARSE_ERR[e && e.code] || (e && e.code === "invalid_json" ? "AI 返回的格式不对，再试一次。" : "出错了，稍后再试。")); }
+function needAI(){ if(S.sample) return true; toast("需要先在“设置 → 连接”里填写 DeepSeek API 密钥。"); return false; }
+const isZh = t => { const s = String(t || "").replace(/\s/g, ""); return s.length > 0 && (s.match(/[\u4e00-\u9fff]/g) || []).length / s.length > .25; };
+const shuffle = a => { for(let i = a.length - 1; i > 0; i--){ const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; };
+
+/* ---------- Generate a set of mock questions ---------- */
+async function genQuestions(){
+  if(!needAI() || PREP.gen) return;
+  const o = mockOpts(); const n = Math.max(1, Math.min(15, +o.n || 8));
+  const cats = o.cats;
+  let langs = o.lang === "zh" ? Array(n).fill("zh") : o.lang === "en" ? Array(n).fill("en") : shuffle(Array.from({length:n}, (_, i) => i < Math.round(n / 2) ? "zh" : "en"));
+  if(o.lang === "mix" && Math.random() < .5 && n % 2) langs = langs.map(l => l === "zh" ? "en" : "zh");
+  const catSeq = []; while(catSeq.length < n) catSeq.push(...shuffle([...cats]));
+  const nh = o.style === "harsh" ? n : o.style === "normal" ? 0 : Math.max(1, Math.round(n / 3));
+  const styles = shuffle(Array.from({length:n}, (_, i) => i < nh ? "harsh" : "normal"));
+  const slots = langs.map((l, i) => ({lang:l, cat:catSeq[i], style:styles[i]}));
+  const scene = (SCENES.find(s => s.k === o.scene) || SCENES[0]).l;
+  const existing = [...S.mock.values()].slice(-40).map(x => "- " + x.q).join("\n");
+  const jb = o.jobId && S.jobs.get(o.jobId) ? await jobBrief(o.jobId) : "";
+  const task = `请出 ${n} 道模拟面试题。面试场景：${scene}。
+${jb ? jb + "\n题目要结合这个单位和岗位（学科方向、所在城市、学校定位）。" : "不针对特定学校，按中国大陆和澳门高校经济、金融、管理学院的常见面试来出。"}
+
+要求：
+- 像真实面试官会问的问题：具体、贴合他的材料，点名具体论文、模型假设、识别或校准、政策含义、教学经历等，不要泛泛而谈。
+- 每个题位规定了风格：
+  · 常规：真实面试官正常会问的问题，态度友好，了解他的研究、教学、规划和动机，可以有一定深度。
+  · 压力：挑战型、尖锐甚至不太客气的问题，像挑剔的评审或学院领导：直接质疑贡献和创新性、模型假设是否现实、理论能否检验、论文多与导师合作是否独立、英文期刊尚无发表能否完成预聘考核、研究方向是否太分散、为什么不去海外或更好的学校、能否长期留下等；可以设置两难或连环追问，但必须专业、针对他材料里的具体内容。
+- 可以覆盖中国高校常见关注点：预聘—长聘考核与发表计划（中文权威期刊与英文期刊）、国家自然科学基金青年项目、课程建设与教学、指导学生、学科与团队建设、为何选择本校和本地、能否全职在岗、与合作者（尤其导师）之间的独立性。
+- 英文题目用地道的英文面试口吻；中文题目用中文。
+${existing ? "- 不要与下面已有的题目重复：\n" + existing + "\n" : ""}
+按下面的题位顺序出题。每个题位规定了语言（zh=中文，en=英文）、主题和风格，题目必须用规定的语言：
+${slots.map((s, i) => `${i + 1}. 语言 ${s.lang}，主题 ${MOCK_CAT_L[s.cat]}，风格 ${s.style === "harsh" ? "压力" : "常规"}`).join("\n")}
+
+只输出 JSON：{"questions":[{"q":"题目","intent":"考察点（中文一句话）","level":"基础|深入|压力"}]}，数组顺序与题位一致，共 ${n} 项。`;
+  PREP.gen = new AbortController(); PREP.genText = "正在读取材料…"; render();
+  try {
+    const sys = prepSystem(await prepContext(jb));
+    PREP.genText = "正在出题…"; drawGenStatus();
+    const out = await S.sample.json([{role:"user", content:sys}, {role:"user", content:task}], {signal:PREP.gen.signal, model:o.model || undefined, json:true,
+      onText:({text}) => { PREP.genText = `正在出题…（已生成 ${text.length} 字）`; drawGenStatus(); }});
+    const qs = (out && Array.isArray(out.questions) ? out.questions : []).filter(x => x && x.q).slice(0, n);
+    if(!qs.length) throw {code:"invalid_json"};
+    const setId = "s" + Date.now().toString(36), at = nowIso();
+    qs.forEach((x, i) => { const id = `${setId}-${i}`; const sl = slots[i] || {cat:"general"};
+      S.mock.set(id, {setId, i, q:String(x.q).trim(), intent:String(x.intent || ""), level:String(x.level || ""), lang:isZh(x.q) ? "zh" : "en", cat:sl.cat, style:sl.style || "normal", src:"ai", jobId:o.jobId || "", scene:o.scene, createdAt:at, updatedAt:at});
+      save("mock", id); });
+    toast(`已生成 ${qs.length} 道题`);
+  } catch(e){ toast(aiErr(e)); }
+  finally { PREP.gen = null; PREP.genText = ""; render(); }
+}
+function drawGenStatus(){ const el = $("#gen-status"); if(el) el.textContent = PREP.genText; }
+
+/* ---------- Reference answers: Chinese and English, three lengths ---------- */
+async function genAnswer(id){
+  if(!needAI() || PREP.busy.has(id)) return;
+  const x = S.mock.get(id); if(!x) return;
+  const o = mockOpts(); const jb = x.jobId ? await jobBrief(x.jobId) : "";
+  const task = `面试题（${x.lang === "en" ? "英文" : "中文"}提问，类别：${MOCK_CAT_L[x.cat] || "综合"}${x.level ? "，" + x.level : ""}）：${x.q}
+${x.intent ? "面试官想考察：" + x.intent : ""}
+${jb}
+
+请为李金璞准备参考回答，中文、英文各一套，每套三种时长：
+- s30：30 秒电梯版，中文约 120 字 / 英文约 75 词：一句结论加一两个支撑点。
+- m1：1 分钟标准版，中文约 250 字 / 英文约 150 词：结论—理由—例证。
+- m3：3 分钟完整版，中文约 700 字 / 英文约 420 词：有清楚的结构，结合具体论文、模型、数据或经历。
+- outline：3–5 条回答要点（短语）。
+${styleOf(x) === "harsh" ? "这是一道压力题：回答要冷静、不卑不亢，先坦然承认其中合理的部分，再用材料里的具体事实正面回应，最后转到积极、可信的计划；不要辩解，不要贬低别人。\n" : ""}要求：第一人称，口语化，可以直接说出口；英文要地道，不要逐句翻译中文；只用材料里的事实，需要他自己补充的信息用【】标出；压力题先坦然承认、再正面化解，不卑不亢；针对具体学校时自然地结合该校情况。
+另外给出 followups：面试官可能接着问的 2–3 个追问（用提问的语言），每个附一句中文应对提示；tip：一句中文，说明这道题的答题策略。
+
+只输出 JSON：{"tip":"","zh":{"s30":"","m1":"","m3":"","outline":[""]},"en":{"s30":"","m1":"","m3":"","outline":[""]},"followups":[{"q":"","hint":""}]}`;
+  const ctl = new AbortController(); PREP.busy.set(id, {kind:"ans", ctl, text:"正在读取材料…"}); redrawMq(id);
+  try {
+    const sys = prepSystem(await prepContext(x.q));
+    PREP.busy.get(id).text = "正在写回答…"; redrawMq(id);
+    const out = await S.sample.json([{role:"user", content:sys}, {role:"user", content:task}], {signal:ctl.signal, model:o.model || undefined, json:true,
+      onText:({text}) => { const b = PREP.busy.get(id); if(b){ b.text = `正在写回答…（已生成 ${text.length} 字）`; const el = document.querySelector(`[data-mq="${CSS.escape(id)}"] .mq-busy`); if(el) el.textContent = b.text; } }});
+    const pick = l => { const v = (out && out[l]) || {}; return {s30:String(v.s30 || ""), m1:String(v.m1 || ""), m3:String(v.m3 || ""), outline:Array.isArray(v.outline) ? v.outline.map(String) : []}; };
+    const ans = {tip:String(out.tip || ""), zh:pick("zh"), en:pick("en"), followups:Array.isArray(out.followups) ? out.followups.filter(f => f && f.q).map(f => ({q:String(f.q), hint:String(f.hint || "")})) : [], at:nowIso(), model:o.model || "默认"};
+    if(!ans.zh.m1 && !ans.en.m1) throw {code:"invalid_json"};
+    patch("mock", id, {ans});
+    if(!PREP.view.has(id)) PREP.view.set(id, {lang:x.lang === "en" ? "en" : "zh", len:"m1"});
+  } catch(e){ toast(aiErr(e)); }
+  finally { PREP.busy.delete(id); redrawMq(id); }
+}
+async function genFeedback(id){
+  if(!needAI() || PREP.busy.has(id)) return;
+  const x = S.mock.get(id); const mine = String((x && x.my) || "").trim();
+  if(!mine){ toast("先在“我的回答”里写下你的回答。"); return; }
+  const jb = x.jobId ? await jobBrief(x.jobId) : "";
+  const task = `面试题：${x.q}
+${jb}
+他的练习回答：
+${mine}
+
+请点评这段回答：先用一句话总体评价，再列 2–3 个优点、2–3 个具体改进建议（指出哪句话怎么改），检查有没有与材料不符或夸大的事实，最后给出一个改进后的版本（与他的回答同一种语言、长度相近）。点评用中文，用简单的 Markdown 列表。`;
+  const ctl = new AbortController(); PREP.busy.set(id, {kind:"fb", ctl, text:"正在点评…"}); patch("mock", id, {fb:""}); redrawMq(id);
+  try {
+    const sys = prepSystem(await prepContext(x.q));
+    const r = await S.sample([{role:"user", content:sys}, {role:"user", content:task}], {signal:ctl.signal, model:mockOpts().model || undefined,
+      onText:({text}) => { const el = document.querySelector(`[data-mq="${CSS.escape(id)}"] .mq-fb`); if(el){ el.hidden = false; el.innerHTML = mdLite(text); } }});
+    patch("mock", id, {fb:r.text, fbAt:nowIso()});
+  } catch(e){ toast(aiErr(e)); }
+  finally { PREP.busy.delete(id); redrawMq(id); }
+}
+
+/* ---------- Background profile ---------- */
+async function regenProfile(){
+  if(!needAI() || PREP.busy.has("profile")) return;
+  if(!S.docs.size){ toast("先上传一些材料。"); return; }
+  const ctl = new AbortController(); PREP.busy.set("profile", {kind:"prof", ctl});
+  openDlg(`<div class="dlg-head"><h2>AI 重新整理背景档案</h2><button class="btn ghost" type="button" data-prof-cancel>关闭</button></div>
+    <div class="dlg-body"><p class="hint" style="margin:0">根据材料库里勾选了“AI 使用”的材料重新整理。整理完你可以选择替换现在的档案，或者不用。</p>
+      <div class="prof-preview" id="prof-preview"><p class="status-line">正在读取材料…</p></div></div>
+    <div class="dlg-foot"><span class="hint" style="margin:0" id="prof-count"></span><div class="r"><button class="btn" type="button" data-prof-cancel>不用</button><button class="btn primary" type="button" id="prof-apply" disabled>替换现在的档案</button></div></div>`, true);
+  const docs = [...S.docs.entries()].filter(([, d]) => d.use !== false).sort(docSort);
+  const texts = await Promise.all(docs.map(([id]) => docText(id).catch(() => "")));
+  const cap = {简历:12000, 求职论文:20000, 研究陈述:20000, 教学:4000, 求职信:5000, 论文:2500, 其他:4000};
+  const mats = docs.map(([, d], i) => texts[i] ? `【${d.kind}｜${d.title}${d.note ? "｜" + d.note : ""}】\n${texts[i].slice(0, cap[d.kind] ?? 3000)}` : "").filter(Boolean).join("\n\n").slice(0, 120000);
+  const task = `下面是李金璞（经济学博士，正在中国大陆和澳门高校找经济、金融、管理科学教职）的求职材料。请整理一份“背景档案”，供之后出模拟面试题和写参考回答时使用。
+用中文 Markdown，分这些部分：基本情况；求职论文（问题、机制、主要结论、政策含义、文献定位）；返修中的论文；已发表论文；在审工作论文（每篇一两句）；其他学术工作（教材、项目、会议、审稿）；教学；荣誉；研究规划；面试中可能被追问的点。
+只写材料里有的事实，不要编造；保留期刊名、合作者、状态等关键信息；总长度 2500–4000 字。
+
+${mats}`;
+  let text = "";
+  try {
+    const r = await S.sample(task, {signal:ctl.signal, model:mockOpts().model || undefined, onText:({text:t}) => { text = t; const el = $("#prof-preview"); if(el) el.innerHTML = mdLite(t); const c = $("#prof-count"); if(c) c.textContent = `${t.length} 字`; }});
+    text = r.text; const b = $("#prof-apply"); if(b){ b.disabled = false; b.onclick = () => { patch("profile", "main", {text, source:"ai"}); closeDlg(); render(); toast("背景档案已更新，原来的版本在数据历史里"); }; }
+  } catch(e){ const el = $("#prof-preview"); if(el) el.insertAdjacentHTML("beforeend", `<p class="ai-err">${esc(aiErr(e))}</p>`); }
+  finally { PREP.busy.delete("profile"); }
+}
+
+/* ---------- First run: import the materials prepared in seed/prep-seed.json ---------- */
+async function importSeed(){
+  if(PREP.seedBusy) return;
+  PREP.seedBusy = "正在读取…"; render();
+  try {
+    let seed; try { seed = JSON.parse(await S.pdb.readRaw("seed/prep-seed.json")); } catch(e){ if(e && e.code === "not_found"){ toast("仓库里没有初始材料，直接上传文件即可。"); return; } throw e; }
+    const docs = seed.docs || [];
+    for(let i = 0; i < docs.length; i++){
+      const d = docs[i]; PREP.seedBusy = `正在导入 ${i + 1}/${docs.length}：${d.title}`; const b = $("#seed-go"); if(b) b.textContent = PREP.seedBusy;
+      if(S.docs.has(d.id)) continue;
+      await writeDocText(d.id, d.text || "", {title:d.title, kind:d.kind, src:d.src || "", note:d.note || "", use:d.use !== false, order:d.order ?? i, createdAt:nowIso()});
+    }
+    if(seed.profile && !(S.prof.get("main") || {}).text){ S.prof.set("main", {text:seed.profile, source:"seed", updatedAt:nowIso()}); save("profile", "main"); }
+    toast(`已导入 ${docs.length} 份材料`);
+  } catch(e){ toast(e && e.code === "auth" ? "GitHub 拒绝写入：检查令牌权限" : "导入失败，检查网络后再试；已导入的不会重复。"); }
+  finally { PREP.seedBusy = ""; render(); }
+}
+
+/* ---------- Upload / update / edit materials ---------- */
+async function uploadDocs(files, replaceId){
+  if(!S.pdb){ toast("面试准备的数据还没连上 GitHub，刷新后再试。"); return; }
+  files = [...files]; let done = 0; const warn = [];
+  for(const f of files){
+    toast(`正在提取文字：${f.name}`);
+    let text;
+    try { text = await extractText(f); }
+    catch(e){ warn.push(e && e.code === "type" ? `不支持 ${f.name}（支持 PDF、Word .docx、TXT）` : e && e.code === "vendor" ? "读取 PDF/Word 的组件没有加载成功，检查网络后再试" : `没能读取 ${f.name}`); continue; }
+    const id = replaceId || ("d" + uid()), cur = S.docs.get(id);
+    const meta = cur ? {src:f.name} : {title:f.name.replace(/\.[^.]+$/, "").replace(/[_]+/g, " "), kind:guessKind(f.name), src:f.name, note:"", use:true, order:999, createdAt:nowIso()};
+    try { await writeDocText(id, text, meta); done++; } catch(e){ warn.push(e && e.code === "auth" ? "GitHub 拒绝写入：检查令牌权限" : `保存 ${f.name} 失败，稍后再试`); continue; }
+    if(text.length < 300) warn.push(`${f.name} 只提取到 ${text.length} 个字，可能是扫描件，可以点“查看/编辑”手动粘贴文字`);
+    render();
+  }
+  toast([done ? (replaceId ? "已更新这份材料" : `已上传 ${done} 份材料`) : "", ...warn].filter(Boolean).join("；"));
+  render();
+}
+async function docDialog(id){
+  const isNew = !id; const d = id ? S.docs.get(id) : {title:"", kind:"其他", note:"", use:true};
+  openDlg(`<div class="dlg-head"><h2>${isNew ? "粘贴一份材料" : "材料：" + esc(d.title)}</h2><button class="btn ghost" type="button" data-close-dlg>关闭</button></div>
+    <form class="dlg-body" id="doc-form">
+      <div class="f2"><label class="field"><span>名称</span><input type="text" name="title" value="${esc(d.title)}" required></label>
+        <label class="field"><span>类别</span><select name="kind">${DOC_KINDS.map(k => `<option${k === d.kind ? " selected" : ""}>${k}</option>`).join("")}</select></label></div>
+      <label class="field"><span>备注（期刊、状态等，AI 会看到）</span><input type="text" name="note" value="${esc(d.note || "")}"></label>
+      <label class="ed-def"><input type="checkbox" name="use"${d.use !== false ? " checked" : ""}> AI 出题和回答时参考这份材料</label>
+      <label class="field"><span>文字内容${d.src ? "（来自 " + esc(d.src) + "）" : ""}</span><textarea name="text" rows="14" id="doc-text" placeholder="${isNew ? "把文字粘贴到这里" : "正在读取…"}"${isNew ? "" : " disabled"}></textarea></label>
+      <p class="hint" style="margin:0" id="doc-chars"></p>
+    </form>
+    <div class="dlg-foot">${isNew ? "<span></span>" : `<button class="btn danger" type="button" data-del-doc="${esc(id)}">删除这份材料</button>`}<div class="r"><button class="btn" type="button" data-close-dlg>取消</button><button class="btn primary" type="submit" form="doc-form">保存</button></div></div>`, true);
+  let orig = "";
+  if(!isNew){ try { orig = await docText(id); } catch { orig = ""; } const ta = $("#doc-text"); if(ta){ ta.value = orig; ta.disabled = false; $("#doc-chars").textContent = `${orig.length} 字`; } }
+  $("#doc-text").addEventListener("input", e => { $("#doc-chars").textContent = `${e.target.value.length} 字${e.target.value.length > DOC_CAP ? `（超过 ${DOC_CAP} 字的部分不会保存）` : ""}`; });
+  $("#doc-form").addEventListener("submit", async ev => {
+    ev.preventDefault(); const fd = new FormData(ev.target);
+    const meta = {title:String(fd.get("title")).trim() || "未命名", kind:fd.get("kind"), note:String(fd.get("note")).trim(), use:fd.get("use") === "on"};
+    const text = String(fd.get("text") || "");
+    const btn = document.querySelector('[form="doc-form"]'); btn.disabled = true; btn.textContent = "正在保存…";
+    try {
+      const nid = id || ("d" + uid());
+      if(isNew || text !== orig) await writeDocText(nid, text, isNew ? {...meta, src:"手动粘贴", order:999, createdAt:nowIso()} : meta);
+      else patch("docs", nid, meta);
+      closeDlg(); render(); toast("已保存");
+    } catch(e){ btn.disabled = false; btn.textContent = "保存"; toast(e && e.code === "auth" ? "GitHub 拒绝写入：检查令牌权限" : "保存失败，检查网络后再试。"); }
+  });
+}
+function deleteDoc(id){
+  const d = S.docs.get(id); if(!d) return;
+  remove("docs", id); closeDlg(); render(); toast("已删除这份材料（GitHub 历史里仍可找回）");
+  if(d.file && S.pdb) S.pdb.deleteRaw(d.file, `prep: 删除材料 ${d.title || id}`).catch(() => {});
+}
+
+/* ---------- Views ---------- */
+function vPrep(){
+  const tab = ["mock","lib","bank","docs"].includes(S.prepTab) ? S.prepTab : "mock";
+  const nMock = S.mock.size, nAns = [...S.mock.values()].filter(x => x.ans).length;
+  const sub = tab === "bank" ? null : tab === "docs" ? `${S.docs.size} 份材料，AI 出题和回答都以这些材料和背景档案为准` : `${nMock} 道模拟题，${nAns} 道已有参考回答`;
+  if(tab === "bank") return vQaBank();
+  if(tab === "lib" && S.pdb && prepLoaded()) return `<div class="view-head"><div><h1>面试准备</h1><p id="prep-sub">题目库：问过的所有题，AI 出的和真实面试的都在这里</p></div></div>${prepTabs()}${vLib()}`;
+  const body = S.pdbFailed ? `<div class="panel"><div class="empty"><strong>面试准备的数据没有连上 GitHub</strong>刷新页面再试。如果一直这样，检查 GitHub 令牌。</div></div>`
+    : !S.pdb || !prepLoaded() ? `<div class="panel"><div class="empty">正在读取…</div></div>` : tab === "docs" ? vDocs() : vMock();
+  return `<div class="view-head"><div><h1>面试准备</h1><p id="prep-sub">${sub}</p></div></div>${prepTabs()}${body}`;
+}
+function libList(){
+  const f = PREP.lib, q = normText(f.q).split(/\s+/).filter(Boolean);
+  return [...S.mock.entries()].filter(([, x]) => {
+    if(f.cat && x.cat !== f.cat) return false;
+    if(f.style && styleOf(x) !== f.style) return false;
+    if(f.lang && x.lang !== f.lang) return false;
+    if(f.src && (x.src === "real" ? "real" : "ai") !== f.src) return false;
+    if(f.st === "noans" && x.ans) return false; if(f.st === "nopr" && x.prac) return false; if(f.st === "pr" && !x.prac) return false; if(f.st === "mine" && !x.my) return false;
+    if(q.length){ const j = x.jobId ? S.jobs.get(x.jobId) : null; const hay = normText([x.q, x.intent, x.my, j && jobName(j), j && j.dept].join(" ")); if(!q.every(t => hay.includes(t))) return false; }
+    return true;
+  }).sort((a, b) => (b[1].createdAt || "").localeCompare(a[1].createdAt || "") || ((a[1].i || 0) - (b[1].i || 0)));
+}
+function libBody(){
+  const list = libList(); const c = $("#lib-count"); if(c) c.textContent = `筛选出 ${list.length} 道`;
+  if(!S.mock.size) return `<div class="empty"><strong>题目库是空的</strong>在“模拟面试”里生成的题会自动收进来；真实面试被问到的题，可以点“记录真实面试问题”。</div>`;
+  if(!list.length) return `<div class="empty">没有符合筛选条件的题。</div>`;
+  return list.slice(0, PREP.libLimit).map(([id, x]) => mqHtml(id, x, true)).join("") + (list.length > PREP.libLimit ? `<div style="padding:12px 16px"><button class="btn" type="button" data-lib-more>再显示 ${Math.min(40, list.length - PREP.libLimit)} 道</button></div>` : "");
+}
+function updateLibBody(){ const el = $("#lib-body"); if(el) el.innerHTML = libBody(); }
+function vLib(){
+  const f = PREP.lib, all = [...S.mock.values()];
+  const nH = all.filter(x => styleOf(x) === "harsh").length, nR = all.filter(x => x.src === "real").length;
+  const sel = (id, v, opts) => `<select id="${id}" aria-label="筛选">${opts.map(([k, l]) => `<option value="${k}"${v === k ? " selected" : ""}>${l}</option>`).join("")}</select>`;
+  return `${seedCallout()}<div class="toolbar lib-tools">
+      <input type="search" id="lib-q" placeholder="搜索题目、学校、我的回答" value="${esc(f.q)}" aria-label="搜索题目">
+      ${sel("lib-cat", f.cat, [["", "全部主题"], ...MOCK_CATS.map(c => [c.k, c.l]), ["pressure", "压力与质疑（旧）"]])}
+      ${sel("lib-style", f.style, [["", "常规和压力"], ["normal", "只看常规"], ["harsh", "只看压力型"]])}
+      ${sel("lib-lang", f.lang, [["", "中英文"], ["zh", "中文题"], ["en", "英文题"]])}
+      ${sel("lib-st", f.st, [["", "全部状态"], ["noans", "还没有参考回答"], ["nopr", "还没练过"], ["pr", "练过的"], ["mine", "写过回答的"]])}
+      ${sel("lib-src", f.src, [["", "全部来源"], ["ai", "AI 出的题"], ["real", "真实面试"]])}
+    </div>
+    <div class="lib-bar"><span class="status-line" id="lib-count">筛选出 ${libList().length} 道</span><span class="status-line">共 ${all.length} 道 · 压力型 ${nH} · 真实面试 ${nR}</span>
+      <span style="margin-left:auto;display:flex;gap:6px;flex-wrap:wrap"><button class="btn sm" type="button" data-real-q>记录真实面试问题</button><button class="btn sm primary" type="button" data-lib-practice>随机练 10 道（按当前筛选）</button></span></div>
+    <div class="panel" id="lib-body">${libBody()}</div>`;
+}
+function realDialog(){
+  const o = mockOpts();
+  openDlg(`<div class="dlg-head"><h2>记录真实面试问题</h2><button class="btn ghost" type="button" data-close-dlg>关闭</button></div>
+    <form class="dlg-body" id="real-form">
+      <label class="field"><span>被问到的问题</span><textarea name="q" rows="3" required placeholder="尽量按原话记"></textarea></label>
+      <div class="f2"><label class="field"><span>学校</span><select name="jobId"><option value="">不记录学校</option>${jobOptions(o.jobId)}</select></label>
+        <label class="field"><span>日期</span><input type="date" name="realDate" value="${todayStr()}"></label>
+        <label class="field"><span>主题</span><select name="cat">${MOCK_CATS.map(c => `<option value="${c.k}">${c.l}</option>`).join("")}</select></label>
+        <label class="field"><span>风格</span><select name="style"><option value="normal">常规</option><option value="harsh">压力型</option></select></label></div>
+      <label class="field"><span>我当时怎么答的 / 对方的追问（可选）</span><textarea name="my" rows="4"></textarea></label>
+    </form>
+    <div class="dlg-foot"><span class="hint" style="margin:0">保存后可以让 AI 写参考回答、点评你的回答。</span><div class="r"><button class="btn" type="button" data-close-dlg>取消</button><button class="btn primary" type="submit" form="real-form">保存</button></div></div>`);
+  $("#real-form").addEventListener("submit", ev => { ev.preventDefault(); const fd = Object.fromEntries(new FormData(ev.target)); const q = String(fd.q || "").trim(); if(!q) return;
+    const id = "r" + uid(), at = nowIso();
+    S.mock.set(id, {setId:"real", i:0, q, intent:"", level:"", lang:isZh(q) ? "zh" : "en", cat:fd.cat, style:fd.style, src:"real", jobId:fd.jobId || "", realDate:fd.realDate || "", my:String(fd.my || ""), createdAt:at, updatedAt:at});
+    save("mock", id); closeDlg(); PREP.lib = {...PREP.lib, src:"", st:""}; render(); toast("已记进题目库"); });
+}
+function prepLoaded(){ return S.ploaded.docs && S.ploaded.prof && S.ploaded.mock; }
+function seedCallout(){
+  if(S.docs.size || (S.prof.get("main") || {}).text) return "";
+  return `<div class="panel callout" style="border-left-color:var(--accent)"><div><strong>还没有材料</strong><span>仓库里已经放好了从“求职文件包”整理出的简历、求职论文、研究陈述、求职信、教学证明和 19 篇论文的文字，以及一份背景档案。导入后就能出题。</span></div>
+    <button class="btn primary" type="button" id="seed-go" data-seed${PREP.seedBusy ? " disabled" : ""}>${esc(PREP.seedBusy || "导入整理好的材料")}</button></div>`;
+}
+function vDocs(){
+  const p = S.prof.get("main") || {};
+  const groups = DOC_KINDS.map(k => [k, [...S.docs.entries()].filter(([, d]) => (d.kind || "其他") === k).sort(docSort)]).filter(([, l]) => l.length);
+  const src = {seed:"整理导入", ai:"AI 整理", manual:"手动修改"}[p.source] || "";
+  return `${seedCallout()}
+    <div class="panel pad prof">
+      <div class="phead"><h2 class="ph">背景档案</h2><span class="status-line">${p.updatedAt ? esc(src) + " · " + esc(new Date(p.updatedAt).toLocaleString("zh-CN", {month:"numeric", day:"numeric", hour:"2-digit", minute:"2-digit"})) : ""}</span>
+        <button class="btn sm" type="button" data-prof-regen${S.sample ? "" : " disabled title=\"需要 DeepSeek 密钥\""}>AI 根据材料重新整理</button></div>
+      <p class="hint" style="margin:0 0 8px">AI 出题和写回答时最先读这份档案。可以直接修改，改动自动保存；写错的事实在这里改掉，AI 就不会再用。</p>
+      <textarea id="prof-text" rows="16" placeholder="还没有背景档案。可以导入整理好的材料，或者上传材料后让 AI 整理。">${esc(p.text || "")}</textarea>
+    </div>
+    <div class="panel docs">
+      <div class="phead pad0"><h2 class="ph">材料库</h2><span class="status-line">${S.docs.size} 份</span>
+        <span style="margin-left:auto;display:flex;gap:6px;flex-wrap:wrap"><button class="btn sm" type="button" data-doc-paste>粘贴文本</button><button class="btn sm primary" type="button" data-doc-upload>上传文件</button></span></div>
+      <p class="hint" style="margin:0;padding:0 16px 10px">支持 PDF、Word（.docx）、TXT，可以一次选多个。文字在浏览器里提取，只把文字存进 GitHub 私有仓库（prep/docs/），原文件留在你电脑上。材料更新了，点那一行的“更新文件”重新上传即可。</p>
+      <input type="file" id="doc-file" multiple accept=".pdf,.docx,.txt,.md" hidden><input type="file" id="doc-refile" accept=".pdf,.docx,.txt,.md" hidden>
+      ${groups.length ? groups.map(([k, l]) => `<div class="kind-group"><h3>${esc(k)}</h3>${l.map(([id, d]) => `
+        <div class="docrow" data-doc="${esc(id)}"><div style="min-width:0"><div class="t1">${esc(d.title || "未命名")}</div>
+          <div class="t2">${[d.note, d.src, d.chars != null ? (d.chars).toLocaleString() + " 字" : "", d.updatedAt ? "更新于 " + fmtDate(d.updatedAt.slice(0, 10), false) : ""].filter(Boolean).map(esc).join(" · ")}${d.chars != null && d.chars < 300 ? ' · <b style="color:var(--soon)">文字很少，可能是扫描件</b>' : ""}</div></div>
+          <span class="docact"><label class="ed-def" title="AI 出题和回答时参考"><input type="checkbox" data-doc-use${d.use !== false ? " checked" : ""}> AI 使用</label>
+            <button class="btn sm" type="button" data-doc-edit>查看/编辑</button><button class="btn sm" type="button" data-doc-refile>更新文件</button></span></div>`).join("")}</div>`).join("")
+        : `<div class="empty">材料库是空的。</div>`}
+    </div>`;
+}
+function vMock(){
+  const o = mockOpts();
+  const sets = new Map(); [...S.mock.entries()].filter(([, x]) => x.src !== "real").sort((a, b) => (b[1].createdAt || "").localeCompare(a[1].createdAt || "") || (a[1].i - b[1].i)).forEach(([id, x]) => { if(!sets.has(x.setId)) sets.set(x.setId, []); sets.get(x.setId).push([id, x]); });
+  const jobsOpt = `<option value="">通用（不针对学校）</option>${jobOptions(o.jobId)}`;
+  const gen = `<div class="panel pad gen">
+      <div class="phead"><h2 class="ph">出一组模拟面试题</h2>${S.docs.size ? "" : '<span class="status-line" style="color:var(--soon)">还没有材料，先到“我的材料”导入</span>'}</div>
+      <div class="gen-grid">
+        <label class="field"><span>针对</span><select data-mo="jobId">${jobsOpt}</select></label>
+        <label class="field"><span>场景</span><select data-mo="scene">${SCENES.map(s => `<option value="${s.k}"${s.k === o.scene ? " selected" : ""}>${s.l}</option>`).join("")}</select></label>
+        <label class="field"><span>题量</span><select data-mo="n">${[5, 8, 12].map(n => `<option${+o.n === n ? " selected" : ""}>${n}</option>`).join("")}</select></label>
+        <label class="field"><span>风格</span><select data-mo="style">${STYLES.map(x => `<option value="${x.k}"${o.style === x.k ? " selected" : ""}>${x.l}</option>`).join("")}</select></label>
+        <label class="field"><span>语言</span><select data-mo="lang">${[["mix","中英随机"],["zh","全中文"],["en","全英文"]].map(([k, l]) => `<option value="${k}"${o.lang === k ? " selected" : ""}>${l}</option>`).join("")}</select></label>
+        <label class="field"><span>AI 模型</span><select data-mo="model"><option value="">设置里的默认模型</option>${["deepseek-flash","deepseek-v4-pro"].map(m => `<option${o.model === m ? " selected" : ""}>${m}</option>`).join("")}</select></label>
+      </div>
+      <div class="field"><span>主题（可多选）</span><div class="cats">${MOCK_CATS.map(c => `<button type="button" class="chip" data-mo-cat="${c.k}" aria-pressed="${o.cats.includes(c.k)}">${c.l}</button>`).join("")}</div></div>
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:10px">
+        <button class="btn primary" type="button" data-gen-q${S.sample ? "" : " disabled"}>${PREP.gen ? "停止" : "生成题目"}</button>
+        <span class="status-line" id="gen-status">${esc(PREP.genText || (S.sample ? "AI 会读你的背景档案和材料来出题，大约需要 20–60 秒。" : "需要先在“设置 → 连接”里填写 DeepSeek API 密钥。"))}</span></div>
+    </div>`;
+  const allSets = [...sets.entries()], shown = allSets.slice(0, 2);
+  const more = allSets.length > 2 || [...S.mock.values()].some(x => x.src === "real") ? `<div class="panel callout" style="border-left-color:var(--accent)"><div><strong>所有问过的题都在“题目库”</strong><span>一共 ${S.mock.size} 道（含真实面试记录），可以按主题、常规/压力、语言、有没有练过来筛选和练习。这里只显示最近两组。</span></div><button class="btn" type="button" data-pt="lib">打开题目库</button></div>` : "";
+  const list = sets.size ? shown.map(([sid, items]) => {
+    const x0 = items[0][1], j = x0.jobId ? S.jobs.get(x0.jobId) : null; const sc = (SCENES.find(s => s.k === x0.scene) || {}).l || "";
+    return `<div class="panel mset" data-set="${esc(sid)}"><div class="mset-head"><div style="min-width:0"><b>${esc(new Date(x0.createdAt).toLocaleString("zh-CN", {month:"numeric", day:"numeric", hour:"2-digit", minute:"2-digit"}))}</b>
+        <span class="status-line">${esc([j ? jobName(j) + (j.dept ? " " + j.dept : "") : "通用", sc, items.length + " 题"].filter(Boolean).join(" · "))}</span></div>
+        <span style="display:flex;gap:6px"><button class="btn sm primary" type="button" data-practice="${esc(sid)}">练习这一组</button><button class="btn sm ghost danger" type="button" data-del-set="${esc(sid)}">删除这组</button></span></div>
+      ${items.map(([id, x]) => mqHtml(id, x)).join("")}</div>`; }).join("") + more
+    : `<div class="panel"><div class="empty"><strong>还没有模拟题</strong>在上面选好学校和题型，点“生成题目”。每道题都可以让 AI 写中英文参考回答（30 秒、1 分钟、3 分钟三种长度）。</div></div>`;
+  return `${seedCallout()}${gen}${list}`;
+}
+function wordCount(t, lang){ return lang === "en" ? (String(t).trim().match(/\S+/g) || []).length : String(t).replace(/[\s\p{P}]/gu, "").length; }
+function speakTime(t, lang){ const n = wordCount(t, lang); const sec = Math.round(n / (lang === "en" ? 140 : 240) * 60); return `${n} ${lang === "en" ? "词" : "字"} · 说完约 ${sec >= 60 ? Math.floor(sec / 60) + " 分 " + (sec % 60) + " 秒" : sec + " 秒"}`; }
+function mqCtx(x){
+  const j = x.jobId ? S.jobs.get(x.jobId) : null;
+  return [x.src === "real" ? "真实面试" + (x.realDate ? " " + fmtDate(x.realDate, false) : "") : x.createdAt ? new Date(x.createdAt).toLocaleDateString("zh-CN", {month:"numeric", day:"numeric"}) + " 出题" : "", j ? jobName(j) + (j.dept ? " " + j.dept : "") : ""].filter(Boolean).join(" · ");
+}
+function mqHtml(id, x, ctx){
+  const busy = PREP.busy.get(id); const a = x.ans; const st = styleOf(x);
+  const v = PREP.view.get(id) || {lang:x.lang === "en" ? "en" : "zh", len:"m1"};
+  const txt = a ? (v.len === "outline" ? (a[v.lang].outline || []) : (a[v.lang][v.len] || "")) : "";
+  const open = PREP.openPractice.has(id) || !!x.my || !!x.fb;
+  return `<div class="mq" data-mq="${esc(id)}">
+    <div class="mq-top"><span class="ltag ltag-${x.lang}">${x.lang === "en" ? "EN" : "中"}</span>${st === "harsh" ? '<span class="stag">压力型</span>' : ""}${x.src === "real" ? '<span class="stag real">真实面试</span>' : ""}<span class="status-line">${esc(MOCK_CAT_L[x.cat] || "综合")}${x.level && x.level !== "压力" ? " · " + esc(x.level) : ""}${x.prac ? " · 练过 " + x.prac + " 次" : ""}${ctx && mqCtx(x) ? " · " + esc(mqCtx(x)) : ""}</span></div>
+    <div class="mq-q">${esc(x.q)}</div>
+    ${x.intent ? `<div class="mq-intent">考察：${esc(x.intent)}</div>` : ""}
+    <div class="mq-acts">
+      ${busy && busy.kind === "ans" ? `<button class="btn sm" type="button" data-mq-stop>停止</button><span class="status-line mq-busy">${esc(busy.text)}</span>`
+        : `<button class="btn sm${a ? "" : " primary"}" type="button" data-mq-ans${S.sample ? "" : " disabled"}>${a ? "重新生成回答" : "AI 参考回答（中英 · 三种时长）"}</button>`}
+      <button class="btn sm" type="button" data-mq-practice aria-pressed="${open}">我来练习</button>
+      <button class="btn sm" type="button" data-mq-bank title="把问题和回答要点存进“我的要点”">存为要点</button>
+      <button class="btn sm ghost danger" type="button" data-mq-del>删除</button>
+    </div>
+    ${a ? `<div class="ans">
+      ${a.tip ? `<div class="ans-tip">答题策略：${esc(a.tip)}</div>` : ""}
+      <div class="seg-row"><div class="seg" role="group" aria-label="语言">${[["zh","中文"],["en","English"]].map(([k, l]) => `<button type="button" data-av-lang="${k}" aria-pressed="${v.lang === k}">${l}</button>`).join("")}</div>
+        <div class="seg" role="group" aria-label="时长">${LENS.map(L => `<button type="button" data-av-len="${L.k}" aria-pressed="${v.len === L.k}">${L.l}</button>`).join("")}</div></div>
+      <div class="ans-text" lang="${v.lang === "en" ? "en" : "zh-CN"}">${v.len === "outline" ? `<ul>${txt.map(t => `<li>${esc(t)}</li>`).join("")}</ul>` : esc(txt).replace(/\n/g, "<br>")}</div>
+      <div class="ans-meta"><span class="status-line">${v.len === "outline" ? `${txt.length} 条要点` : esc(speakTime(txt, v.lang))}</span><button class="btn sm ghost" type="button" data-copy-ans>复制</button></div>
+      ${a.followups && a.followups.length ? `<details class="fups"><summary>可能的追问（${a.followups.length}）</summary><ul>${a.followups.map(f => `<li><b>${esc(f.q)}</b>${f.hint ? `<span>${esc(f.hint)}</span>` : ""}</li>`).join("")}</ul></details>` : ""}
+    </div>` : ""}
+    <div class="mq-prac"${open ? "" : " hidden"}>
+      <label class="field"><span>我的回答（练习稿，自动保存）</span><textarea rows="5" id="my-${esc(id)}" data-mq-my placeholder="先自己说一遍或写下来，再让 AI 点评。">${esc(x.my || "")}</textarea></label>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">${busy && busy.kind === "fb" ? `<button class="btn sm" type="button" data-mq-stop>停止</button><span class="status-line">正在点评…</span>` : `<button class="btn sm" type="button" data-mq-fb${S.sample ? "" : " disabled"}>AI 点评我的回答</button>`}</div>
+      <div class="mq-fb ai-a"${x.fb ? "" : " hidden"}>${x.fb ? mdLite(x.fb) : ""}</div>
+    </div>
+  </div>`;
+}
+function redrawMq(id){
+  const el = document.querySelector(`[data-mq="${CSS.escape(id)}"]`); const x = S.mock.get(id);
+  if(!el || !x) return;
+  const tmp = document.createElement("div"); tmp.innerHTML = mqHtml(id, x, !!el.closest("#lib-body")); const next = tmp.firstElementChild;
+  const a = document.activeElement;
+  if(a && el.contains(a) && a.tagName === "TEXTAREA"){
+    // The user is typing a practice answer in this card: swap everything except the practice box
+    for(const sel of [".mq-acts", ".ans", ".mq-prac .mq-fb", ".mq-prac > div"]){ const n = next.querySelector(sel), c = el.querySelector(sel); if(n && c) c.replaceWith(n); else if(n && sel === ".ans") el.querySelector(".mq-acts").after(n); else if(c && !n) c.remove(); }
+    return;
+  }
+  el.replaceWith(next);
+  const sub = $("#prep-sub"); if(sub && S.prepTab === "mock") sub.textContent = `${S.mock.size} 道模拟题，${[...S.mock.values()].filter(v => v.ans).length} 道已有参考回答`;
+}
+function addToBank(id){
+  const x = S.mock.get(id); if(!x) return;
+  const a = x.ans, L = x.lang === "en" ? "en" : "zh";
+  const body = a ? [...(a[L].outline || []).map(t => "· " + t), "", a[L].m1 || ""].join("\n").trim() : (x.my || "");
+  const cat = QA_CATS.includes(QA_CAT_MAP[x.cat]) ? QA_CAT_MAP[x.cat] : (QA_CATS.includes("通用") ? "通用" : QA_CATS[0]);
+  const qid = uid(); S.qa.set(qid, {q:x.q, a:body, cat, level:a ? 1 : 0, jobId:x.jobId || "", createdAt:nowIso(), from:"mock"}); save("qa", qid);
+  toast("已存进“我的要点”");
+}
+
+/* ---------- Practice mode: one question at a time, with a timer ---------- */
+let PRAC = null;
+function startPractice(setId){ startPracticeIds([...S.mock.entries()].filter(([, x]) => x.setId === setId).map(([id]) => id)); }
+function markPracticed(){
+  if(!PRAC) return; const id = PRAC.ids[PRAC.i]; if(PRAC.marked.has(id)) return;
+  if(PRAC.show || Date.now() - PRAC.t0 >= 15000){ PRAC.marked.add(id); const x = S.mock.get(id); if(x) patch("mock", id, {prac:(x.prac || 0) + 1, pracAt:nowIso()}); }
+}
+function startPracticeIds(ids){
+  if(!ids.length){ toast("没有可以练习的题"); return; }
+  PRAC = {ids:shuffle([...ids]), i:0, t0:Date.now(), show:false, timer:null, marked:new Set()}; drawPractice();
+  PRAC.timer = setInterval(() => { const el = $("#prac-clock"); if(!el || !PRAC) return; const s = Math.floor((Date.now() - PRAC.t0) / 1000); el.textContent = `${pad(Math.floor(s / 60))}:${pad(s % 60)}`; el.dataset.over = s > 180 ? "1" : ""; }, 500);
+}
+function drawPractice(){
+  if(!PRAC) return; const id = PRAC.ids[PRAC.i], x = S.mock.get(id); if(!x){ stopPractice(); return; }
+  const a = x.ans, L = x.lang === "en" ? "en" : "zh";
+  openDlg(`<div class="dlg-head"><h2>练习 ${PRAC.i + 1} / ${PRAC.ids.length}</h2><span class="prac-clock" id="prac-clock">00:00</span><button class="btn ghost" type="button" data-prac-end>结束</button></div>
+    <div class="dlg-body">
+      <div><span class="ltag ltag-${x.lang}">${x.lang === "en" ? "EN" : "中"}</span> ${styleOf(x) === "harsh" ? '<span class="stag">压力型</span>' : ""}<span class="status-line">${esc(MOCK_CAT_L[x.cat] || "")}${x.prac ? " · 练过 " + x.prac + " 次" : ""}</span></div>
+      <div class="prac-q">${esc(x.q)}</div>
+      <p class="hint" style="margin:0">先计时把回答说出来，再看参考回答。1 分钟版大约是一段完整回答的长度。</p>
+      ${PRAC.show ? (a ? `<div class="ans"><div class="ans-text">${esc(a[L].m1 || "").replace(/\n/g, "<br>")}</div>${(a[L].outline || []).length ? `<ul class="prac-ol">${a[L].outline.map(t => `<li>${esc(t)}</li>`).join("")}</ul>` : ""}</div>`
+        : `<div class="empty" style="padding:16px">这道题还没有参考回答。${S.sample ? `<br><button class="btn sm" type="button" data-prac-ans>现在生成</button>` : ""}</div>`) : ""}
+    </div>
+    <div class="dlg-foot"><button class="btn" type="button" data-prac-show>${PRAC.show ? "隐藏参考回答" : "看参考回答"}</button>
+      <div class="r"><button class="btn" type="button" data-prac-step="-1"${PRAC.i ? "" : " disabled"}>上一题</button><button class="btn primary" type="button" data-prac-step="1">${PRAC.i + 1 < PRAC.ids.length ? "下一题" : "完成"}</button></div></div>`, true);
+}
+function stopPractice(){ if(PRAC){ markPracticed(); clearInterval(PRAC.timer); PRAC = null; } closeDlg(); if(S.view === "prep") render(); }
+
+/* ---------- Events for the prep views ---------- */
+document.addEventListener("click", e => {
+  const t = e.target.closest("[data-pt],[data-seed],[data-prof-regen],[data-prof-cancel],[data-doc-upload],[data-doc-paste],[data-doc-edit],[data-doc-refile],[data-del-doc],[data-gen-q],[data-mo-cat],[data-mq-ans],[data-mq-stop],[data-mq-practice],[data-mq-fb],[data-mq-bank],[data-mq-del],[data-av-lang],[data-av-len],[data-copy-ans],[data-practice],[data-del-set],[data-prac-end],[data-prac-show],[data-prac-step],[data-prac-ans],[data-lib-more],[data-lib-practice],[data-real-q]");
+  if(!t) return;
+  const mq = t.closest("[data-mq]"), id = mq && mq.dataset.mq;
+  if(t.matches("[data-lib-more]")){ PREP.libLimit += 40; updateLibBody(); return; }
+  if(t.matches("[data-lib-practice]")){ startPracticeIds(shuffle(libList().map(([id]) => id)).slice(0, 10)); return; }
+  if(t.matches("[data-real-q]")){ realDialog(); return; }
+  if(t.matches("[data-pt]")){ S.prepTab = t.dataset.pt; lsSet("jd-preptab", S.prepTab); render(); return; }
+  if(t.matches("[data-seed]")){ importSeed(); return; }
+  if(t.matches("[data-prof-regen]")){ regenProfile(); return; }
+  if(t.matches("[data-prof-cancel]")){ const b = PREP.busy.get("profile"); if(b) b.ctl.abort(); closeDlg(); return; }
+  if(t.matches("[data-doc-upload]")){ $("#doc-file").click(); return; }
+  if(t.matches("[data-doc-paste]")){ docDialog(null); return; }
+  if(t.matches("[data-doc-edit]")){ docDialog(t.closest("[data-doc]").dataset.doc); return; }
+  if(t.matches("[data-doc-refile]")){ const f = $("#doc-refile"); f.dataset.target = t.closest("[data-doc]").dataset.doc; f.click(); return; }
+  if(t.matches("[data-del-doc]")){ armDelete(t, () => deleteDoc(t.dataset.delDoc)); return; }
+  if(t.matches("[data-gen-q]")){ if(PREP.gen){ PREP.gen.abort(); return; } genQuestions(); return; }
+  if(t.matches("[data-mo-cat]")){ const o = mockOpts(), k = t.dataset.moCat; const cats = o.cats.includes(k) ? o.cats.filter(x => x !== k) : [...o.cats, k];
+    if(!cats.length){ toast("至少选一个题型"); return; } setMockOpts({cats}); t.setAttribute("aria-pressed", String(cats.includes(k))); return; }
+  if(t.matches("[data-mq-ans]")){ genAnswer(id); return; }
+  if(t.matches("[data-mq-stop]")){ const b = PREP.busy.get(id); if(b) b.ctl.abort(); return; }
+  if(t.matches("[data-mq-practice]")){ const box = mq.querySelector(".mq-prac"); const show = box.hidden; box.hidden = !show; show ? PREP.openPractice.add(id) : PREP.openPractice.delete(id); t.setAttribute("aria-pressed", String(show)); if(show) box.querySelector("textarea").focus(); return; }
+  if(t.matches("[data-mq-fb]")){ flushAll(); genFeedback(id); return; }
+  if(t.matches("[data-mq-bank]")){ addToBank(id); return; }
+  if(t.matches("[data-mq-del]")){ armDelete(t, () => { remove("mock", id); PREP.view.delete(id); mq.remove(); if($("#lib-body")) updateLibBody(); toast("已删除"); }); return; }
+  if(t.matches("[data-av-lang],[data-av-len]")){ const x = S.mock.get(id); const v = {...(PREP.view.get(id) || {lang:x.lang === "en" ? "en" : "zh", len:"m1"})};
+    if(t.dataset.avLang) v.lang = t.dataset.avLang; if(t.dataset.avLen) v.len = t.dataset.avLen; PREP.view.set(id, v); redrawMq(id); return; }
+  if(t.matches("[data-copy-ans]")){ const el = mq.querySelector(".ans-text"); const txt = el ? el.innerText : ""; (navigator.clipboard ? navigator.clipboard.writeText(txt) : Promise.reject()).then(() => toast("已复制"), () => toast("复制失败，可以手动选中复制")); return; }
+  if(t.matches("[data-practice]")){ startPractice(t.dataset.practice); return; }
+  if(t.matches("[data-del-set]")){ armDelete(t, () => { const sid = t.dataset.delSet; let n = 0; for(const [k, x] of [...S.mock.entries()]) if(x.setId === sid){ remove("mock", k); n++; } render(); toast(`已删除 ${n} 道题`); }); return; }
+  if(t.matches("[data-prac-end]")){ stopPractice(); return; }
+  if(t.matches("[data-prac-show]")){ PRAC.show = !PRAC.show; markPracticed(); drawPractice(); return; }
+  if(t.matches("[data-prac-step]")){ markPracticed(); const k = +t.dataset.pracStep; if(PRAC.i + k >= PRAC.ids.length){ stopPractice(); toast("这一组练完了"); return; } PRAC.i = Math.max(0, PRAC.i + k); PRAC.show = false; PRAC.t0 = Date.now(); drawPractice(); return; }
+  if(t.matches("[data-prac-ans]")){ const pid = PRAC.ids[PRAC.i]; const btn = t; btn.disabled = true; btn.textContent = "正在生成…（20–60 秒）"; genAnswer(pid).then(() => { if(PRAC && PRAC.ids[PRAC.i] === pid) drawPractice(); }); return; }
+});
+dlg.addEventListener("close", () => { if(PRAC){ markPracticed(); clearInterval(PRAC.timer); PRAC = null; if(S.view === "prep") setTimeout(() => render(), 0); } const b = PREP.busy.get("profile"); if(b) b.ctl.abort(); });
+document.addEventListener("compositionend", e => { if(e.target && e.target.id === "lib-q"){ PREP.lib.q = e.target.value; PREP.libLimit = 40; updateLibBody(); } }, true);
+document.addEventListener("input", e => {
+  const t = e.target;
+  if(t.id === "lib-q"){ if(e.isComposing || COMPOSING) return; PREP.lib.q = t.value; PREP.libLimit = 40; updateLibBody(); return; }
+  if(t.id === "prof-text"){ const cur = S.prof.get("main") || {}; S.prof.set("main", {...cur, text:t.value, source:"manual", updatedAt:nowIso()}); save("profile", "main", 1000); return; }
+  if(t.matches("[data-mq-my]")){ const id = t.closest("[data-mq]").dataset.mq; const x = S.mock.get(id); if(x){ S.mock.set(id, {...x, my:t.value, updatedAt:nowIso()}); save("mock", id, 1000); } return; }
+});
+document.addEventListener("change", e => {
+  const t = e.target;
+  if(/^lib-(cat|style|lang|st|src)$/.test(t.id)){ PREP.lib[t.id.slice(4)] = t.value; PREP.libLimit = 40; updateLibBody(); return; }
+  if(t.matches("[data-mo]")){ setMockOpts({[t.dataset.mo]: t.dataset.mo === "n" ? +t.value : t.value}); return; }
+  if(t.id === "doc-file" && t.files.length){ const fs = [...t.files]; t.value = ""; uploadDocs(fs); return; }
+  if(t.id === "doc-refile" && t.files.length){ const fs = [...t.files], target = t.dataset.target; t.value = ""; uploadDocs(fs.slice(0, 1), target); return; }
+  if(t.matches("[data-doc-use]")){ patch("docs", t.closest("[data-doc]").dataset.doc, {use:t.checked}); return; }
+});
+
+function prepTabs(){ return `<div class="ptabs" role="tablist">${[["mock","模拟面试"],["lib","题目库"],["bank","我的要点"],["docs","我的材料"]].map(([k, l]) => `<button type="button" role="tab" class="ptab" data-pt="${k}" aria-selected="${S.prepTab === k}">${l}</button>`).join("")}</div>`; }
+
 /* ---------- Boot ---------- */
 setView(location.hash.slice(1) || "overview");
 (async () => {
@@ -2371,6 +3054,22 @@ setView(location.hash.slice(1) || "overview");
     }
   }, err => { console.error(err); if(err.code === "revoked") { S.denied = true; render(); } else toast("数据同步中断，请刷新页面。"); });
   sub("jobs","jobs"); sub("events","events"); sub("materials","mats"); sub("qa","qa"); sub("meta","meta");
+  (async () => {
+    const pdb = await window.claude.use("prep");
+    if(!pdb){ S.pdbFailed = true; if(S.view === "prep") render(); return; }
+    S.pdb = pdb;
+    const psub = (coll, key) => pdb.collection(coll).onSnapshot(snap => {
+      let changed = false;
+      for(const ch of snap.docChanges()){
+        const id = ch.doc.id; if(timers.has(`${coll}/${id}`)) continue;
+        if(ch.type === "removed"){ S[key].delete(id); changed = true; }
+        else { const d = ch.doc.data(); const cur = S[key].get(id); if(!cur || JSON.stringify(cur) !== JSON.stringify(d)){ S[key].set(id, {...d}); changed = true; } }
+      }
+      const first = !S.ploaded[key]; S.ploaded[key] = true;
+      if((first || changed) && S.view === "prep") render(!first);
+    }, err => console.error(err));
+    psub("docs","docs"); psub("profile","prof"); psub("mock","mock");
+  })();
   setTimeout(() => { if(!allLoaded()){ const el = $("#boot"); if(el) el.innerHTML = "<strong>还在等待数据…</strong>如果一直停在这里，你可能不是这个页面的所有者，或者需要刷新。"; } }, 8000);
   setInterval(() => { if(!document.hidden && S.view !== "prep") render(); }, 60 * 60 * 1000); // roll the day over
 })();
