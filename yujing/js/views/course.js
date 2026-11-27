@@ -1,12 +1,13 @@
 // 核心课程：课程路线（#/course）、一课（#/unit/:id）、知识体系（#/library/grammar）
 import {
   kanaSpeech, S, LANGS, COURSE, COURSE_DATA, courseUnit, courseState, nextCourse, courseProgress, unitWords, grammarOf, grammarLearned,
-  completeCourse, foundProgress, foundReady, nextUnit, UNITS, findScene, practicePool, addSpeak, LEVELS,
+  completeCourse, foundProgress, foundReady, nextUnit, UNITS, findScene, practicePool, addSpeak, LEVELS, masteryOf, weakPoints,
 } from '../store.js';
 import { speak, stop, sttAvailable, listen } from '../speech.js';
 import { esc, romaji, shuffle, toast, similarity } from '../util.js';
 import { ICON, header, playBtn, tl, readingLine, frSpace } from '../ui.js';
 import { baseTabs } from './library.js';
+import { reportBtn, setReportCtx } from '../report.js';
 
 const unitNo = (lang, u) => COURSE[lang].indexOf(u) + 1;
 const isMe = who => who === '我';
@@ -37,7 +38,8 @@ export function renderCourse(el, lang) {
     <section class="stage ${cp.done === cp.total ? 'done' : ready ? 'now' : ''}">
       <div class="stage-head"><span class="stage-no">2</span><div><h2>核心课程 A1 → B2</h2><p class="muted">${cp.total} 课 · 每课约 15–25 分钟 · 已学 ${cp.done}</p></div></div>
       <div class="m-bar"><i style="width:${Math.round(cp.done / cp.total * 100)}%"></i></div>
-      <p class="stage-note">四个级别${lang === 'ja' ? '（对应日语能力考试 N5 → N2）' : '（欧洲语言共同参考框架）'}。每课一个真实情景或一篇短文：先听，再学新词和语法，最后做听、选、拼、说的练习。${!ready ? '<br><b>建议先完成发音入门</b>，不过也可以先进来看看。' : ''}</p>
+      <p class="stage-note">四个级别${lang === 'ja' ? '（对应日语能力考试 N5 → N2）' : '（欧洲语言共同参考框架）'}。每课一个真实情景或一篇短文：先听，再学新词和语法，最后做听、选、拼、说的练习。${!ready && !S().placement[lang] ? '<br><b>建议先完成发音入门</b>，不过也可以先进来看看。' : ''}</p>
+      ${cp.done < 3 ? `<a class="pl-entry" href="#/placement"><span aria-hidden="true">🧭</span><span><b>学过一些${LANGS[lang].meta.name}？先做个分级测试</b><small>约 10 分钟，测出该从第几课开始，不用从头学</small></span></a>` : `<p class="stage-note"><a href="#/placement">重新做分级测试</a></p>`}
       ${LEVELS[lang].map(([lv, name, desc]) => {
         const us = COURSE[lang].filter(u => u.level === lv);
         const d = us.filter(u => courseState(lang, u.id).done).length;
@@ -46,11 +48,11 @@ export function renderCourse(el, lang) {
           <div class="m-bar thin"><i style="width:${us.length ? Math.round(d / us.length * 100) : 0}%"></i></div>
           <ol class="path">${us.map(u => {
             const st = courseState(lang, u.id);
-            const cls = st.done ? 'done' : u === nc ? 'next' : '';
+            const cls = (st.done ? 'done' : u === nc ? 'next' : '') + (st.placed ? ' placed' : '');
             return `<li class="${cls}"><a href="#/unit/${u.id}">
               <span class="p-node">${st.done ? '✓' : u.emoji}</span>
               <span class="p-main"><small>第 ${unitNo(lang, u)} 课 · ${esc(u.sub)}</small><b ${lang === 'ja' ? 'lang="ja"' : ''}>${esc(u.title)}</b><em>${esc(u.can)}</em></span>
-              <span class="p-state">${st.done ? (st.best ? st.best + '%' : '') : u === nc ? '开始' : ''}</span></a></li>`;
+              <span class="p-state">${st.placed ? '测试通过' : st.done ? (st.best ? st.best + '%' : '') : u === nc ? '开始' : ''}</span></a></li>`;
           }).join('')}</ol></details>`;
       }).join('')}
     </section>
@@ -70,27 +72,39 @@ export function renderKnowledge(el, lang, filter) {
   const learned = grammarLearned(lang);
   const lvOf = g => { const L = learned[g.id]; return L ? courseUnit(lang, L.unit)?.level || '' : ''; };
   const ord = g => { const L = learned[g.id]; return L ? COURSE[lang].findIndex(u => u.id === L.unit) : -1; };
-  let all = grammarOf(lang);
-  const total = all.length, nDone = all.filter(g => learned[g.id]?.done).length;
-  const lv = (filter && LEVELS[lang].some(([l]) => l === filter)) ? filter : '';
-  if (lv) all = all.filter(g => lvOf(g) === lv);
+  const full = grammarOf(lang);
+  const M = Object.fromEntries(full.map(g => [g.id, masteryOf(lang, g.id)]));
+  const cnt = k => full.filter(g => (M[g.id]?.level || 'none') === k).length;
+  const n = { strong: cnt('strong'), ok: cnt('ok'), weak: cnt('weak'), none: cnt('none') };
+  const total = full.length;
+  const lv = filter === 'weak' ? 'weak' : (filter && LEVELS[lang].some(([l]) => l === filter)) ? filter : '';
+  let all = full;
+  if (lv === 'weak') all = full.filter(g => M[g.id]?.level === 'weak');
+  else if (lv) all = full.filter(g => lvOf(g) === lv);
   const byCat = {};
   for (const g of [...all].sort((a, b) => ord(a) - ord(b))) (byCat[D.CAT[g.id] || '其他'] ||= []).push(g);
   const cats = [...D.CAT_ORDER, ...Object.keys(byCat).filter(c => !D.CAT_ORDER.includes(c))].filter(c => byCat[c]);
   const unitLabel = id => { const u = courseUnit(lang, id); return u ? `第 ${unitNo(lang, u)} 课` : ''; };
+  const pct = k => (n[k] / total * 100).toFixed(1);
+  const SRC = { lesson: '课内练习', review: '复习', test: '分级测试', drill: '补练' };
   el.innerHTML = `${header('课程')}${baseTabs('grammar')}
-    <p class="lede">${LANGS[lang].meta.name}从 A1 到 B2 的语法骨架。每个点都在某一课里第一次出现，学完那一课就点亮。点进去看讲解和例句，也可以问 AI 老师。</p>
-    <div class="km-sum"><b>${nDone}</b> / ${total} 个语法点已学<div class="m-bar"><i style="width:${Math.round(nDone / total * 100)}%"></i></div></div>
-    <div class="seg km-filter">${[['', '全部'], ...LEVELS[lang].map(([l]) => [l, l])].map(([k, n]) => `<a href="#/library/grammar${k ? '/' + k : ''}" class="${k === lv ? 'on' : ''}">${n}</a>`).join('')}</div>
+    <p class="lede">${LANGS[lang].meta.name}从 A1 到 B2 的语法骨架。每个点都显示掌握度：课内练习、复习、测试和补练的正确率，再乘上记忆保持。点进去看讲解、做专项练习。</p>
+    <div class="km-sum">
+      <div class="km-stack" role="img" aria-label="牢固 ${n.strong}，一般 ${n.ok}，薄弱 ${n.weak}，未学 ${n.none}"><i class="strong" style="width:${pct('strong')}%"></i><i class="ok" style="width:${pct('ok')}%"></i><i class="weak" style="width:${pct('weak')}%"></i></div>
+      <ul class="km-legend"><li><i class="strong"></i>牢固 <b>${n.strong}</b></li><li><i class="ok"></i>一般 <b>${n.ok}</b></li><li><i class="weak"></i>薄弱 <b>${n.weak}</b></li><li><i class="none"></i>未学 <b>${n.none}</b></li></ul>
+      ${n.weak ? `<a class="btn primary small" href="#/drill">补练薄弱点</a>` : n.strong + n.ok === 0 ? `<a class="btn ghost small" href="#/placement">学过一些？做分级测试</a>` : ''}
+    </div>
+    <div class="seg km-filter">${[['', '全部'], ...LEVELS[lang].map(([l]) => [l, l]), ['weak', '薄弱']].map(([k, nm]) => `<a href="#/library/grammar${k ? '/' + k : ''}" class="${k === lv ? 'on' : ''}">${nm}</a>`).join('')}</div>
     ${cats.map(c => {
       const list = byCat[c];
-      const d = list.filter(g => learned[g.id]?.done).length;
+      const d = list.filter(g => M[g.id] && M[g.id].level !== 'weak').length;
       return `<section class="km-cat"><h2>${esc(c)} <span class="muted">${d}/${list.length}</span></h2>
         <ul class="km-list">${list.map(g => {
-          const L = learned[g.id];
-          return `<li class="${L?.done ? 'done' : ''}"><a href="#/grammar/${g.id}"><span class="km-dot" aria-hidden="true"></span><span class="km-t">${esc(g.title)}</span><small>${L ? `<i class="lv-mini">${lvOf(g)}</i>${L.done ? '已学 · ' : ''}${unitLabel(L.unit)}` : '发音入门'}</small></a></li>`;
+          const L = learned[g.id], m = M[g.id];
+          return `<li class="${m ? m.level : ''}"><a href="#/grammar/${g.id}"><span class="mbar ${m ? m.level : 'none'}" aria-hidden="true"><i style="width:${m ? m.score : 0}%"></i></span><span class="km-t">${esc(g.title)}</span><small>${L ? `<i class="lv-mini">${lvOf(g)}</i>${unitLabel(L.unit)}` : '发音入门'}${m ? ` · <b class="msc">${m.score}</b>` : ''}</small></a></li>`;
         }).join('')}</ul></section>`;
-    }).join('') || '<p class="hint">这个级别还没有语法点。</p>'}`;
+    }).join('') || `<p class="hint">${lv === 'weak' ? '没有薄弱点。' : '这个级别还没有语法点。'}</p>`}
+    <p class="hint">${Object.entries(SRC).map(([k, v]) => v).join('、')}都会更新掌握度；隔一段时间没练，数字会慢慢下降，提醒你回来复习。</p>`;
 }
 
 // ======================================================================
@@ -116,7 +130,9 @@ export function renderUnit(el, lang, id) {
   const st = courseState(lang, unit.id);
   const say = (text, o = {}) => speak(text, lang, { count: true, ...o });
 
-  const top = (label, pct) => `<div class="review-top"><a class="icon-btn back" href="#/course" aria-label="退出这一课">${ICON.back}</a><div class="bar"><i style="width:${pct}%"></i></div><span class="count">${esc(label)}</span></div>`;
+  let where = '开场';
+  setReportCtx(() => ({ lang, unit: unit.id, label: `第 ${no} 课 ${unit.title}`, where }));
+  const top = (label, pct) => { where = label; return `<div class="review-top"><a class="icon-btn back" href="#/course" aria-label="退出这一课">${ICON.back}</a><div class="bar"><i style="width:${pct}%"></i></div><span class="count">${esc(label)}</span>${reportBtn()}</div>`; };
   const rd = r => (ja && r ? readingLine(r, romaji(r), lang) : '');
 
   intro();

@@ -2,7 +2,7 @@ import * as FR from './data/fr.js';
 import * as JA from './data/ja.js';
 import * as FD from './data/found.js';
 import { COURSE_DATA as CD, LEVELS as CL, levelOf as clevel } from './data/course_index.js';
-import { newCard, schedule, isMature, isLearned, DAY } from './fsrs.js';
+import { newCard, schedule, isMature, isLearned, DAY, retrievability } from './fsrs.js';
 import { dayKey, endOfDay, romaji, uid } from './util.js';
 
 export const LANGS = { fr: FR, ja: JA };
@@ -48,6 +48,9 @@ const DEFAULT = {
   stamps: [],       // [{ lang, sceneId, text, date }]
   found: {},        // 入门课进度 { 'ja|h1': { done, at, best, skipped } }
   notes: {},        // 卡片联想笔记 { cardId: { text, ai, t } }
+  mastery: {},      // 语法掌握度证据 { 'fr|g-imparfait': { s: 0–1 正确率, n: 证据次数, t: 最近时间, src } }
+  placement: {},    // 分级测试结果 { fr: { at, start, level, asked, correct } }
+  reports: [],      // 课程内容纠错 [{ id, lang, unit, where, kind, text, quote, t, done }]
   lastNotified: '',
 };
 
@@ -236,6 +239,12 @@ export function rate(id, g) {
   t.reviews++;
   if (g > 1) t.correct++;
   state.log.push([Date.now(), id, g, +elapsed.toFixed(2), prevState]);
+  // 课文句卡的回忆结果，也是那一课语法点的掌握证据
+  if (id.includes('|u|')) {
+    const [lang, , ref] = id.split('|');
+    const u = courseUnit(lang, ref.split('#')[0]);
+    if (u) noteEvidence(lang, u.grammar, g >= 3 ? 1 : g === 2 ? 0.6 : 0, 0.5, 'review');
+  }
   if (state.log.length > 6000) state.log.splice(0, state.log.length - 6000);
   save();
 }
@@ -254,7 +263,7 @@ function newCandidates(lang, kind) {
   const cw = courseWordUnits(lang);
   const doneUnit = key => cw[key] && courseState(lang, cw[key]).done;
   const list = wordsOf(lang).map((w, i) => ({ id: `${lang}|w|${wordId(w)}`, key: wordId(w), tag: lang === 'fr' ? w[5] : w[6], i }));
-  const pri = x => (doneUnit(x.key) ? 0 : doneScenes.has(x.tag) ? 1 : x.tag === 'core' ? 2 : x.tag === 'num' ? 3 : 4) * 10000 + x.i;
+  const pri = x => x.tag === 'bridge' ? -10000 + x.i : (doneUnit(x.key) ? 0 : doneScenes.has(x.tag) ? 1 : x.tag === 'core' ? 2 : x.tag === 'num' ? 3 : 4) * 10000 + x.i;
   return list.filter(x => (!state.cards[x.id] || state.cards[x.id].state === 'new') && (x.tag !== 'course' || doneUnit(x.key))).sort((a, b) => pri(a) - pri(b)).map(x => x.id);
 }
 
@@ -399,6 +408,7 @@ export function completeCourse(lang, unit, results) {
   }
   let sents = 0;
   unit.sentences.forEach((_, i) => { const id = `${lang}|u|${unit.id}#${i}`; if (!state.cards[id]) { ensureCard(id); sents++; } });
+  noteEvidence(lang, unit.grammar, (results.score ?? 80) / 100, 1, 'lesson');
   if (first) state.stamps.push({ lang, sceneId: 'course-' + unit.id, text: unit.can, title: '第 ' + (COURSE[lang].indexOf(unit) + 1) + ' 课 ' + unit.title, emoji: unit.emoji, date: dayKey() });
   save();
   return { first, words, sents };
@@ -413,6 +423,78 @@ export function practicePool(lang) {
     ...u.dialogue.map(d => ({ t: d[1], r: ja ? d[2] : '', zh: ja ? d[3] : d[2], unit: u.id })),
   ]);
 }
+
+// ---------- 语法掌握度 ----------
+// 掌握度 = 正确率（课内练习、复习、测试、补练的滑动平均）× 记忆保持（相关复习卡的可提取度，或按时间衰减）
+const gUnits = {};
+export function grammarUnits(lang, gid) {
+  if (!gUnits[lang]) {
+    const m = {};
+    for (const u of COURSE[lang]) for (const g of u.grammar) (m[g] ||= []).push(u);
+    gUnits[lang] = m;
+  }
+  return gUnits[lang][gid] || [];
+}
+function noteEvidence(lang, gids, x, w = 1, src = 'lesson') {
+  const now = Date.now();
+  for (const g of gids) {
+    const k = lang + '|' + g, m = state.mastery[k];
+    if (!m) state.mastery[k] = { s: +x.toFixed(3), n: 1, t: now, src };
+    else { const a = Math.min(0.6, 0.4 * w); m.s = +(m.s + a * (x - m.s)).toFixed(3); m.n++; m.t = now; m.src = src; }
+  }
+}
+export function addEvidence(lang, gids, x, w = 1, src = 'drill') { noteEvidence(lang, gids, x, w, src); save(); }
+
+export function masteryOf(lang, gid) {
+  const m = state.mastery[lang + '|' + gid];
+  const units = grammarUnits(lang, gid);
+  const learned = units.some(u => courseState(lang, u.id).done);
+  if (!m && !learned) return null;
+  const s = m ? m.s : 0.7;
+  // 记忆保持：相关课文句卡的平均可提取度；没有复习过的卡就按距上次练习的时间估算
+  const now = Date.now(), rs = [];
+  for (const u of units) u.sentences.forEach((_, i) => {
+    const c = state.cards[`${lang}|u|${u.id}#${i}`];
+    if (!c || c.state === 'new' || !c.last) return;
+    rs.push(c.state === 'review' ? retrievability((now - c.last) / DAY, Math.max(c.s, 0.1)) : 0.85);
+  });
+  let R, why;
+  if (rs.length) { R = rs.reduce((a, b) => a + b, 0) / rs.length; why = 'cards'; }
+  else {
+    const n = m ? m.n : 1, t = m ? m.t : (units.map(u => courseState(lang, u.id).at || 0).sort().pop() || now);
+    R = retrievability((now - t) / DAY, 3 * 2 ** (Math.min(n, 6) - 1)); why = 'time';
+  }
+  const score = Math.round(100 * s * (0.5 + 0.5 * R));
+  return { score, acc: Math.round(s * 100), keep: Math.round(R * 100), n: m?.n || 0, src: m?.src || 'lesson', t: m?.t || 0, why, level: score >= 80 ? 'strong' : score >= 60 ? 'ok' : 'weak' };
+}
+// 薄弱点：学过或测过、掌握度 < 60 的语法点，最弱的在前
+export function weakPoints(lang, max = 99) {
+  const out = [];
+  for (const g of grammarOf(lang)) {
+    const m = masteryOf(lang, g.id);
+    if (m && m.score < 60 && grammarUnits(lang, g.id).length) out.push({ g, m });
+  }
+  return out.sort((a, b) => a.m.score - b.m.score).slice(0, max);
+}
+
+// ---------- 分级测试 ----------
+// start = 推荐开始的那一课（下标）；之前的课标记为"测试通过"，词按每日额度进入复习验证
+export function applyPlacement(lang, { start, probes = {}, asked = 0, correct = 0, skipFound = false }) {
+  const now = Date.now();
+  COURSE[lang].slice(0, start).forEach(u => {
+    const k = lang + '|' + u.id;
+    if (!state.found[k]?.done) state.found[k] = { done: true, at: now, skipped: true, placed: true };
+    noteEvidence(lang, u.grammar, probes[u.id] ?? 0.75, 1, 'test');
+  });
+  if (skipFound) for (const u of UNITS[lang]) { const k = lang + '|' + u.id; if (!state.found[k]?.done) state.found[k] = { done: true, skipped: true, at: now }; }
+  const at = COURSE[lang][start];
+  state.placement[lang] = { at: now, start, level: at ? at.level : 'B2+', asked, correct };
+  save();
+}
+
+// ---------- 课程纠错 ----------
+export function addReport(r) { state.reports.push({ id: uid(), t: Date.now(), done: false, ...r }); save(); }
+export function setReportDone(id, done) { const r = state.reports.find(x => x.id === id); if (r) { r.done = done; r.t2 = Date.now(); save(); } }
 
 // ---------- 联想笔记 ----------
 export const noteOf = id => state.notes[id];
@@ -494,6 +576,7 @@ export function syncPayload(st = state) {
     onboarded: st.onboarded, active: st.active, settings, settingsAt: st.settingsAt || 0,
     cards: st.cards, intro: st.intro, dd: st.dd, log: st.log, scenes: st.scenes,
     custom: st.custom, readings: st.readings, stamps: st.stamps, found: st.found, notes: st.notes,
+    mastery: st.mastery, placement: st.placement, reports: st.reports,
   };
 }
 
@@ -559,7 +642,15 @@ export function mergeStates(local, remote) {
     const l = out.found[k];
     if (!l) { out.found[k] = r; continue; }
     const at = Math.min(l.at || Infinity, r.at || Infinity);
-    out.found[k] = { done: !!(l.done || r.done), at: at === Infinity ? undefined : at, best: Math.max(l.best || 0, r.best || 0) || undefined, ...(l.skipped && r.skipped ? { skipped: true } : {}) };
+    out.found[k] = { done: !!(l.done || r.done), at: at === Infinity ? undefined : at, best: Math.max(l.best || 0, r.best || 0) || undefined, ...(l.skipped && r.skipped ? { skipped: true } : {}), ...(l.placed && r.placed ? { placed: true } : {}) };
+  }
+  // 掌握度：每个语法点取最近更新的那份；分级测试取最近一次；纠错：并集（后改的生效）
+  for (const [k, r] of Object.entries(remote.mastery || {})) { const l = out.mastery[k]; if (!l || (r.t || 0) > (l.t || 0)) out.mastery[k] = r; }
+  for (const [k, r] of Object.entries(remote.placement || {})) { const l = out.placement[k]; if (!l || (r.at || 0) > (l.at || 0)) out.placement[k] = r; }
+  {
+    const m = new Map(out.reports.map(x => [x.id, x]));
+    for (const r of remote.reports || []) { const l = m.get(r.id); if (!l || (r.t2 || r.t) > (l.t2 || l.t)) m.set(r.id, r); }
+    out.reports = [...m.values()].sort((a, b) => a.t - b.t);
   }
   for (const [id, r] of Object.entries(remote.notes || {})) {
     const l = out.notes[id];

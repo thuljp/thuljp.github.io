@@ -1,4 +1,5 @@
-import { S, save, LANGS, exportState, replaceState, resetAll, touchSettings } from '../store.js';
+import { S, save, LANGS, exportState, replaceState, resetAll, touchSettings, setReportDone } from '../store.js';
+import { reportsMarkdown } from '../report.js';
 import { syncCfg, saveSyncCfg, testRepo, syncNow, syncStatus, onSyncStatus, jobdeskToken, startSync } from '../sync.js';
 import { PRESETS, testConnection, jobdeskConfig } from '../ai.js';
 import { voicesFor, speak } from '../speech.js';
@@ -86,6 +87,13 @@ export function renderSettings(el) {
       ? '<button class="btn primary" id="snow">立即同步</button><button class="btn ghost" id="soff">断开这台设备</button>'
       : '<button class="btn primary" id="son">测试并开启</button>'}</div>
     <p class="test-out" id="sout" aria-live="polite"></p>
+  </section>
+
+  <section class="panel" id="reports">
+    <h2>课程纠错 <span class="muted">${S().reports.filter(r => !r.done).length} 条待处理</span></h2>
+    <p>学习时在课里点右上角的小旗子，或在语法页底部点"报告问题"，记下发现的内容错误。这些记录会随学习数据同步，可以复制出来统一修正。</p>
+    ${S().reports.length ? `<ul class="rp-list">${S().reports.slice().reverse().map(r => `<li class="${r.done ? 'done' : ''}"><label class="check"><input type="checkbox" data-rid="${esc(r.id)}" ${r.done ? 'checked' : ''}> <span><b>${esc(r.label || r.unit || '')}</b> · ${esc(r.where || '')} · ${esc(r.kind)}${r.quote ? `<br><q>${esc(r.quote)}</q>` : ''}${r.text ? `<br>${esc(r.text)}` : ''}</span></label></li>`).join('')}</ul>
+    <div class="row"><button class="btn" id="rp-copy">复制全部（Markdown）</button><button class="btn ghost" id="rp-dl">下载</button></div>` : '<p class="hint">还没有记录。</p>'}
   </section>
 
   <section class="panel">
@@ -195,6 +203,11 @@ export function renderSettings(el) {
     busy(e.currentTarget, false);
   };
 
+  el.querySelectorAll('[data-rid]').forEach(c => c.onchange = () => { setReportDone(c.dataset.rid, c.checked); c.closest('li').classList.toggle('done', c.checked); });
+  q('#rp-copy')?.addEventListener('click', async () => {
+    try { await navigator.clipboard.writeText(reportsMarkdown()); toast('已复制'); } catch { download(`yujing-纠错-${dayKey()}.md`, reportsMarkdown(), 'text/markdown'); }
+  });
+  q('#rp-dl')?.addEventListener('click', () => download(`yujing-纠错-${dayKey()}.md`, reportsMarkdown(), 'text/markdown'));
   q('#exp').onclick = () => {
     const data = JSON.parse(exportState());
     data.settings.ai.apiKey = ''; // 备份里不含 Key

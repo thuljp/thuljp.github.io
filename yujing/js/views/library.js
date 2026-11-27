@@ -1,6 +1,7 @@
-import { S, wordsOf, grammarOf, LANGS, addCustomWords, ensureCard, save, addReading, addInput, findScene } from '../store.js';
+import { S, wordsOf, grammarOf, LANGS, addCustomWords, ensureCard, save, addReading, addInput, findScene, masteryOf, grammarUnits, COURSE } from '../store.js';
 import { isMature, isLearned } from '../fsrs.js';
 import { aiReady, generateWords, generateReading, ask } from '../ai.js';
+import { setReportCtx } from '../report.js';
 import { speak, stop } from '../speech.js';
 import { esc, romaji, toast } from '../util.js';
 import { tl, readingLine, ICON, header, busy, playBtn } from '../ui.js';
@@ -13,7 +14,7 @@ function status(id) {
 }
 
 export function baseTabs(cur) {
-  const tabs = [['course', '路线', '#/course'], ['map', '发音', '#/map'], ['grammar', '知识体系', '#/library/grammar'], ['words', '单词', '#/library/words']];
+  const tabs = [['course', '路线', '#/course'], ['map', '发音', '#/map'], ['grammar', '知识体系', '#/library/grammar'], ['bridge', '捷径', '#/library/bridge'], ['words', '单词', '#/library/words']];
   return `<div class="seg tabs" role="tablist">${tabs.map(([k, n, h]) => `<a role="tab" href="${h}" class="${k === cur ? 'on' : ''}" aria-selected="${k === cur}">${n}</a>`).join('')}</div>`;
 }
 
@@ -73,8 +74,20 @@ export function renderGrammar(el, lang, id, from) {
   const g = grammarOf(lang).find(x => x.id === id);
   if (!g) { el.innerHTML = header('找不到这节语法', '#/library/grammar'); return; }
   const back = from ? (from.startsWith('unit-') ? `#/unit/${from.slice(5)}` : `#/scene/${from}/1`) : '#/library/grammar';
+  const m = masteryOf(lang, id);
+  const us = grammarUnits(lang, id);
+  const SRC = { lesson: '课内练习', review: '复习', test: '分级测试', drill: '补练' };
   el.innerHTML = `${header(esc(g.title), back)}
+    ${us.length ? `<section class="mastery-panel ${m ? m.level : 'none'}">
+      <div class="mp-num"><b>${m ? m.score : '—'}</b><span>掌握度</span></div>
+      <div class="mp-main">
+        <div class="mbar ${m ? m.level : 'none'}"><i style="width:${m ? m.score : 0}%"></i></div>
+        <p class="muted">${m ? `正确率 ${m.acc}% · 记忆保持 ${m.keep}%${m.n ? ` · 最近来自${SRC[m.src] || '练习'}` : ''}` : '还没学过。'} · 在${us.map(u => `<a href="#/unit/${u.id}">第 ${COURSE[lang].indexOf(u) + 1} 课</a>`).join('、')}学</p>
+      </div>
+      <a class="btn ${m && m.level === 'weak' ? 'primary' : 'ghost'} small" href="#/drill/${id}">专项练习</a>
+    </section>` : ''}
     <article class="lesson" lang="zh">${g.body}</article>
+    <p class="report-line"><button class="link-btn" data-report>讲解有误？报告问题</button></p>
     <h2>例句</h2>
     <ul class="chunks">${g.ex.map(([t, m]) => `<li>${playBtn(t, lang)}<div>${tl(t, lang)}<p class="zh">${esc(m)}</p></div></li>`).join('')}</ul>
     <section class="panel">
@@ -83,6 +96,7 @@ export function renderGrammar(el, lang, id, from) {
       <button class="btn" id="ask">问 AI 老师</button>
       <div class="answer-box" aria-live="polite"></div>
     </section>`;
+  setReportCtx(() => ({ lang, unit: us[0]?.id || '', label: '语法「' + g.title + '」', where: g.id }));
   el.querySelector('#ask').onclick = async e => {
     const q = el.querySelector('#q').value.trim();
     if (!q) return;

@@ -1,4 +1,4 @@
-import { S, save, LANGS, counts, scenesOf, sceneState, studiedOn, todayTotal as todayRec, stats, onChange, nextUnit, foundProgress, foundReady, UNITS, COURSE, nextStep, courseProgress, practicePool } from './store.js';
+import { S, save, LANGS, counts, scenesOf, sceneState, studiedOn, todayTotal as todayRec, stats, onChange, nextUnit, foundProgress, foundReady, UNITS, COURSE, nextStep, courseProgress, practicePool, weakPoints } from './store.js';
 import { aiReady } from './ai.js';
 import { stop } from './speech.js';
 import { startReminderLoop } from './reminder.js';
@@ -12,6 +12,8 @@ import { renderProgress } from './views/progress.js';
 import { renderSettings } from './views/settings.js';
 import { renderMap, renderLesson } from './views/learn.js';
 import { renderCourse, renderUnit, renderKnowledge } from './views/course.js';
+import { renderPlacement, renderDrill } from './views/assess.js';
+import { renderBridge, renderBridgeQuiz } from './views/bridge.js';
 import { renderPractice } from './views/practice.js';
 
 const view = document.getElementById('view');
@@ -20,7 +22,7 @@ const langSwitch = document.getElementById('lang-switch');
 bindSay(view);
 
 const NAV = [['today', '今天', ICON.today], ['course', '课程', ICON.library], ['practice', '练习', ICON.practice], ['progress', '进度', ICON.progress], ['settings', '设置', ICON.settings]];
-const NAV_OF = { scene: 'practice', scenes: 'practice', read: 'practice', unit: 'course', map: 'course', lesson: 'course', library: 'course', grammar: 'course', review: 'today' };
+const NAV_OF = { scene: 'practice', scenes: 'practice', read: 'practice', unit: 'course', map: 'course', lesson: 'course', library: 'course', grammar: 'course', placement: 'course', drill: 'course', 'bridge-quiz': 'course', review: 'today' };
 nav.innerHTML = NAV.map(([k, n, i]) => `<a href="#/${k}" data-nav="${k}">${i}<span>${n}</span></a>`).join('');
 
 function drawLangSwitch() {
@@ -53,7 +55,7 @@ function route() {
   drawLangSwitch();
   const navKey = NAV_OF[parts[0]] || parts[0];
   nav.querySelectorAll('a').forEach(a => a.classList.toggle('on', a.dataset.nav === navKey));
-  document.body.classList.toggle('focus-mode', ['review', 'welcome', 'lesson', 'unit'].includes(parts[0]) || (parts[0] === 'practice' && ['dictation', 'speak'].includes(parts[1])));
+  document.body.classList.toggle('focus-mode', ['review', 'welcome', 'lesson', 'unit', 'placement', 'drill', 'bridge-quiz'].includes(parts[0]) || (parts[0] === 'practice' && ['dictation', 'speak'].includes(parts[1])));
   view.scrollTop = 0; window.scrollTo(0, 0);
   const from = new URLSearchParams(query || '').get('from');
   switch (parts[0]) {
@@ -65,8 +67,11 @@ function route() {
     case 'lesson': return renderLesson(view, lang, parts[1]);
     case 'course': return renderCourse(view, lang);
     case 'unit': return renderUnit(view, lang, parts[1]);
+    case 'placement': return renderPlacement(view, lang);
+    case 'drill': return renderDrill(view, lang, parts[1]);
+    case 'bridge-quiz': return renderBridgeQuiz(view, lang);
     case 'practice': return renderPractice(view, lang, parts[1], new URLSearchParams(query || ''));
-    case 'library': return parts[1] === 'sounds' ? renderMap(view, lang) : parts[1] === 'grammar' ? renderKnowledge(view, lang, parts[2]) : renderLibrary(view, lang, parts[1] || 'words');
+    case 'library': return parts[1] === 'sounds' ? renderMap(view, lang) : parts[1] === 'grammar' ? renderKnowledge(view, lang, parts[2]) : parts[1] === 'bridge' ? renderBridge(view, lang, parts[2]) : renderLibrary(view, lang, parts[1] || 'words');
     case 'grammar': return renderGrammar(view, lang, parts[1], from);
     case 'read': return renderRead(view, lang, parts[1]);
     case 'progress': return renderProgress(view, lang);
@@ -107,6 +112,7 @@ function renderToday(el, lang) {
   }
   const PR = [['dictation', '听写', '听一句写一句，8 句约 6 分钟', '#/practice/dictation'], ['speak', '跟读', '听原声跟着说，语音识别打分', '#/practice/speak'], ['write', '写作', aiReady() ? '按课程题目写几句，AI 批改' : '按课程题目写几句，对照范文', '#/practice/write'], ['read', '阅读', aiReady() ? '用你会的词写成的小故事，可以只听不看' : '接入 AI 后每天一篇定制短文', aiReady() ? '#/read' : '#/settings']];
   const pr = PR[(Number(dayKey().slice(-2)) + (cp.done ? 0 : 1)) % PR.length];
+  const weak = weakPoints(lang, 3);
 
   // 本周
   const k = dayKey();
@@ -133,6 +139,12 @@ function renderToday(el, lang) {
           <p class="muted">${ready ? '约 10–15 分钟。先回忆，再看答案。' : `学完前 ${lang === 'ja' ? 8 : 5} 课（基础发音）后，每天开始学新词。`}</p></div>
         ${reviewDone ? '<span class="tick" aria-label="已完成">✓</span>' : `<a class="btn ${step && !lessonToday ? '' : 'primary'}" href="#/review">开始</a>`}
       </li>
+      ${weak.length ? `<li>
+        <div class="plan-main"><h2>补练薄弱点</h2>
+          <p>${weak.map(x => esc(x.g.title.split('：')[0])).join('、')}</p>
+          <p class="muted">掌握度低于 60 · 约 6 分钟 · <a href="#/library/grammar/weak">看全部</a></p></div>
+        <a class="btn ghost" href="#/drill">去补</a>
+      </li>` : ''}
       <li class="${sceneDoneToday ? 'done' : ''}">
         <div class="plan-main"><h2>今日场景</h2>
           ${sceneDoneToday ? `<p>${doneTodayScene.emoji} ${esc(doneTodayScene.title)} ${tl(doneTodayScene.place, lang, 'muted')}</p>
@@ -158,7 +170,7 @@ function renderToday(el, lang) {
       <p><b>① 发音入门</b>：每天 1–2 节，${lang === 'ja' ? '大约两周把平假名、片假名和发音规则过一遍' : '大约一周把法语的所有发音和拼读规则过一遍'}。</p>
       <p><b>② 核心课程</b>：${COURSE[lang].length} 课，从 A1 到 B2${lang === 'ja' ? '（N5 → N2）' : ''}，每课一个真实情景或一篇短文，系统学完语法和高频词。</p>
       <p><b>③ 进阶练习</b>：听写、跟读、写作、场景对话、阅读，把学过的东西反复用起来。学过的内容会在快要忘的时候出现在<b>复习</b>里。</p>
-      <a class="btn ghost" href="#/course">看课程路线</a>
+      <a class="btn ghost" href="#/course">看课程路线</a>${!st.placement[lang] && !cp.done ? `<a class="btn ghost" href="#/placement">学过一些？做分级测试</a>` : ''}
     </section>` : ''}
 
     ${other.length ? `<p class="other-lang">${other.map(l => { const oc = counts(l); return `<button class="link-btn" data-sw="${l}">${LANGS[l].meta.flag} ${LANGS[l].meta.name}：${oc.due} 张到期，${oc.fresh} 个新条目</button>`; }).join('')}</p>` : ''}
